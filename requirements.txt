@@ -1,0 +1,15 @@
+# --- Core Framework ---
+streamlit>=1.42.0
+mcp[cli]>=1.2.0
+
+# --- AI & LLM ---
+openai>=1.60.0
+python-dotenv>=1.0.1
+
+# --- Communication & Data ---
+requests>=2.32.3
+pandas>=2.2.3
+pydantic>=2.10.0
+
+# --- Audio & Voice (Sửa lại version ở đây) ---
+streamlit-mic-recorder==0.0.8
