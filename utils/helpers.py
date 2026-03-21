@@ -22,18 +22,22 @@ def safe_json_loads(s: str, default: Any):
     except Exception:
         return default
 
-def clamp_score_0_5(x: Any) -> float:
+def clamp_score(x: Any, lo: float = -2.0, hi: float = 2.0) -> float:
+    """Clamp value vào khoảng [lo, hi]. Mặc định scale -2..+2."""
     try:
         v = float(x)
     except Exception:
         v = 0.0
-    return max(0.0, min(5.0, v))
+    return max(lo, min(hi, v))
 
-def normalize_ai_scores(payload: Dict[str, Any]) -> Dict[str, float]:
+def normalize_ai_scores(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Chuẩn hoá scores từ LLM response về đúng scale -2..+2."""
     scores = payload.get("scores") or {}
     return {
-        "clean": clamp_score_0_5(scores.get("clean")),
-        "safe": clamp_score_0_5(scores.get("safe")),
-        "support": clamp_score_0_5(scores.get("support")),
-        "speed": clamp_score_0_5(scores.get("speed")),
+        "clean": clamp_score(scores.get("clean", 0)),
+        "safe": clamp_score(scores.get("safe", 0)),
+        "support": clamp_score(scores.get("support", 0)),
+        "speed": clamp_score(scores.get("speed", 0)),
+        "price": clamp_score(scores.get("price", 0)),
+        "is_closed": bool(scores.get("is_closed", False)),
     }

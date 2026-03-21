@@ -4,143 +4,459 @@ import asyncio
 import json
 import sys
 import nest_asyncio
-import re
 from pathlib import Path
 from dotenv import load_dotenv
-from openai import OpenAI
 
-# MCP & Core
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from core import SYSTEM_PROMPT, SafeWashEvaluator
-# Tạm thời comment voice engine để tránh lỗi import nếu chưa fix xong env
-# from core import elevenlabs_stt, elevenlabs_tts 
-
-# --- SETTINGS ---
-VOICE_ENABLED = False  # Gạt sang True nếu ông muốn dùng lại Voice
+# CRITICAL: load .env BEFORE any core imports (agents.py needs OPENROUTER_API_KEY)
 load_dotenv()
 nest_asyncio.apply()
 
+# MCP
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+# Core
+from core.evaluator import SafeWashEvaluator
+from core.agents import route, analyze_shops, advise, general_tips
+from core.voice_engine import blaze_stt, blaze_tts
+from utils.helpers import safe_json_loads, normalize_ai_scores
+
 # --- CONFIG ---
+if not os.getenv("OPENROUTER_API_KEY"):
+    st.error("⚠️ Thiếu OPENROUTER_API_KEY trong .env. Vui lòng cấu hình trước khi chạy.")
+    st.stop()
+
 SERVER_SCRIPT = Path(__file__).parent / "server" / "mcp_server.py"
 server_params = StdioServerParameters(
     command=sys.executable,
     args=[str(SERVER_SCRIPT)],
-    env=os.environ.copy()
+    env=os.environ.copy(),
 )
 
-client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.getenv("OPENROUTER_API_KEY"))
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="SafeWash AI - Đánh Giá Rửa Xe", page_icon="🛡️", layout="wide")
 
-st.set_page_config(page_title="SafeWash AI Auditor", page_icon="🛡️", layout="wide")
+# --- SESSION STATE ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "recommendations" not in st.session_state:
+    st.session_state.recommendations = []
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+if "last_intent" not in st.session_state:
+    st.session_state.last_intent = None
+if "voice_enabled" not in st.session_state:
+    st.session_state.voice_enabled = bool(os.getenv("BLAZE_API_KEY"))
+if "selected_shop" not in st.session_state:
+    st.session_state.selected_shop = None
 
-# Session State initialization
-if "messages" not in st.session_state: st.session_state.messages = []
-if "recommendations" not in st.session_state: st.session_state.recommendations = []
-if "logs" not in st.session_state: st.session_state.logs = []
 
-# --- AGENT LOGIC: LLM-as-a-Judge ---
-async def call_agent_with_mcp(user_input):
+# ─────────────────────────────────────────────────────────────
+#  MCP DATA LAYER — call the right tool based on intent
+# ─────────────────────────────────────────────────────────────
+async def fetch_data_from_mcp(intent_info: dict) -> str:
+    """Call the appropriate MCP tool based on router's intent classification."""
+    intent = intent_info.get("intent", "general")
+    location = intent_info.get("location")
+    shop_name = intent_info.get("shop_name")
+
     try:
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                st.session_state.logs.append("✅ MCP Server connected.")
+                st.session_state.logs.append("✅ MCP connected")
 
-                # BƯỚC 1: Lấy dữ liệu thô từ MCP Tool
-                data_response = await session.call_tool("get_all_stores", {})
+                # Pick the right tool
+                if intent == "inspect" and shop_name:
+                    st.session_state.logs.append(f"🔍 Inspecting: {shop_name}")
+                    resp = await session.call_tool("get_audit_evidence", {"shop_name": shop_name})
+                elif intent == "compare" and shop_name:
+                    st.session_state.logs.append(f"⚖️ Comparing: {shop_name}")
+                    resp = await session.call_tool("compare_shops", {"shop_names": shop_name})
+                elif intent == "busyness" and shop_name:
+                    st.session_state.logs.append(f"📊 Busyness: {shop_name}")
+                    resp = await session.call_tool("get_shop_busyness", {"shop_name": shop_name})
+                elif intent == "recommend" and location:
+                    st.session_state.logs.append(f"📍 Location search: {location}")
+                    resp = await session.call_tool("find_shops_by_location", {"location_name": location})
+                else:
+                    st.session_state.logs.append("📦 Fetching all shops")
+                    resp = await session.call_tool("list_all_shops", {})
 
-                # Robust extract text payload (tùy MCP content shape)
-                raw_data = ""
-                if getattr(data_response, "content", None):
-                    c0 = data_response.content[0]
-                    raw_data = getattr(c0, "text", "") or getattr(c0, "data", "") or ""
-                if not raw_data:
-                    raw_data = "[]"
-
-                st.session_state.logs.append(f"📦 Evidence gathered: {len(raw_data)} bytes")
-
-                # BƯỚC 2: Gọi LLM để Judge
-                user_payload = f"DATA TO AUDIT:\n{raw_data}\n\nUSER REQUEST: {user_input}"
-
-                response = client.chat.completions.create(
-                    model="openai/gpt-4o",
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        # (optional) lịch sử chat nếu bạn thật sự cần:
-                        # ...st.session_state.messages,
-                        {"role": "user", "content": user_payload},
-                    ],
-                    response_format={"type": "json_object"},
-                )
-                return response.choices[0].message.content, raw_data
+                raw = ""
+                if getattr(resp, "content", None):
+                    c0 = resp.content[0]
+                    raw = getattr(c0, "text", "") or getattr(c0, "data", "") or ""
+                st.session_state.logs.append(f"📦 Data: {len(raw)} bytes")
+                return raw or "[]"
     except Exception as e:
-        st.session_state.logs.append(f"❌ MCP/LLM Error: {str(e)}")
-        return json.dumps({"comment": "Lỗi kết nối dữ liệu.", "scores": None}), "[]"
+        st.session_state.logs.append(f"❌ MCP Error: {e}")
+        return "[]"
 
-# --- UI HEADER ---
-st.title("🛡️ SafeWash AI: Expert Auditor")
-st.caption(f"Trạng thái: {'Voice Active 🎤' if VOICE_ENABLED else 'Text Only 📝'}")
 
-with st.expander("🛠️ Debug Trace System"):
-    for log in st.session_state.logs:
-        st.caption(log)
+# ─────────────────────────────────────────────────────────────
+#  ORCHESTRATOR — runs the 3-agent pipeline
+# ─────────────────────────────────────────────────────────────
+def run_pipeline(user_message: str) -> tuple[str, list[dict], dict]:
+    """
+    Returns (display_text, shop_cards, intent_info).
+    Pipeline: Router → MCP fetch → Analyst → Advisor
+    """
+    # STEP 1: Router classifies intent
+    st.session_state.logs.append("🧠 Router agent: classifying...")
+    intent_info = route(user_message)
+    st.session_state.logs.append(f"   → intent={intent_info.get('intent')}, loc={intent_info.get('location')}, shop={intent_info.get('shop_name')}")
+
+    # STEP 1b: General questions skip data fetch
+    if intent_info.get("intent") == "general":
+        st.session_state.logs.append("💡 General tips agent")
+        result = general_tips(user_message)
+        return result.get("summary", ""), [], intent_info
+
+    # STEP 2: Fetch data via MCP
+    raw_data = asyncio.run(fetch_data_from_mcp(intent_info))
+
+    # STEP 3: Analyst enriches data
+    st.session_state.logs.append("📈 Analyst agent: chấm điểm...")
+    sort_order = intent_info.get("sort_order", "best")
+    apply_threshold = intent_info.get("intent") == "recommend"
+    analyzed = analyze_shops(raw_data, sort_order=sort_order, apply_threshold=apply_threshold)
+
+    if not analyzed:
+        return "Không tìm thấy tiệm nào phù hợp. Hãy thử hỏi với tên quận hoặc tên tiệm cụ thể.", [], intent_info
+
+    # STEP 4: Advisor generates response
+    st.session_state.logs.append("🎯 Advisor agent: tạo câu trả lời...")
+    result = advise(user_message, analyzed, intent_info)
+
+    # Build display
+    summary = result.get("summary", "")
+    warnings = result.get("warnings") or []
+    scores = result.get("scores")
+
+    parts = [summary]
+    if warnings:
+        parts.append("\n**⚠️ Cảnh báo:**")
+        for w in warnings:
+            parts.append(f"- {w}")
+    if scores:
+        norm_scores = normalize_ai_scores({"scores": scores})
+        trust = SafeWashEvaluator.calculate_trust_index(norm_scores)
+        parts.append(f"\n📊 **Chỉ số Tin cậy SafeWash: {trust}/10**")
+
+    display_text = "\n".join(parts)
+    return display_text, analyzed, intent_info
+
+
+# ═══════════════════════════════════════════════════════════════
+#                           UI
+# ═══════════════════════════════════════════════════════════════
+
+# --- SIDEBAR ---
+with st.sidebar:
+    st.image("https://img.icons8.com/fluency/96/car-wash.png", width=64)
+    st.title("SafeWash AI")
+    st.caption("Hệ thống đánh giá an toàn tiệm rửa xe thông minh")
+    st.divider()
+
+    # Voice toggle
+    has_voice_key = bool(os.getenv("BLAZE_API_KEY"))
+    if has_voice_key:
+        st.session_state.voice_enabled = st.toggle(
+            "🎙️ Giọng nói", value=st.session_state.voice_enabled
+        )
+    else:
+        st.session_state.voice_enabled = False
+
+    st.divider()
+    st.markdown("### 🤖 Kiến trúc Đa Agent")
+    st.markdown("""
+    - **Router Agent** — Phân loại ý định
+    - **Analyst Agent** — Chấm điểm & phân tích
+    - **Advisor Agent** — Tư vấn & đề xuất
+    - **Voice Agent** — STT ↔ TTS (ElevenLabs)
+    """)
+    st.divider()
+
+    st.markdown("### 💡 Gợi ý nhanh")
+    suggestions = [
+        "Tiệm rửa xe an toàn nhất?",
+        "Tiệm nào tốt ở Tân Phú?",
+        "So sánh VinaWash và ProWash",
+        "VinaWash đông nhất lúc nào?",
+        "Mẹo bảo vệ sơn xe khi rửa?",
+    ]
+    for s in suggestions:
+        if st.button(s, key=f"sug_{s}", use_container_width=True):
+            st.session_state["_pending_input"] = s
+
+    st.divider()
+    with st.expander("🛠️ Nhật ký Agent"):
+        for log in st.session_state.logs:
+            st.caption(log)
+    if st.button("🗑️ Xoá lịch sử chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.recommendations = []
+        st.session_state.logs = []
+        st.session_state.last_intent = None
+        st.session_state.selected_shop = None
+        st.rerun()
+
+# --- HEADER ---
+st.title("🛡️ SafeWash AI: Chuyên gia Đánh giá")
+
+if st.session_state.last_intent:
+    intent_map = {
+        "recommend": "🔎 Đang đề xuất",
+        "compare": "⚖️ Đang so sánh",
+        "inspect": "🔬 Đang kiểm tra",
+        "busyness": "📊 Giờ cao điểm",
+        "general": "💡 Mẹo chung",
+    }
+    label = intent_map.get(st.session_state.last_intent, "💬")
+    st.caption(f"Chế độ: {label}")
 
 # --- RENDER CHAT ---
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# --- INPUT HANDLING ---
-st.write("---")
+# --- INPUT ---
+pending = st.session_state.pop("_pending_input", None)
 
-# Logic Voice (Đã comment lại)
-# if VOICE_ENABLED:
-#     from streamlit_mic_recorder import mic_recorder
-#     audio_data = mic_recorder(start_prompt="🎤 Nói chuyện", stop_prompt="🛑 Dừng", key="v_input")
-#     if audio_data:
-#         input_query = elevenlabs_stt(audio_data['bytes'])
-#         if input_query: st.chat_message("user").write(input_query)
+# Voice input via mic icon
+voice_text = None
+if st.session_state.voice_enabled:
+    try:
+        from streamlit_mic_recorder import mic_recorder
+        audio_data = mic_recorder(
+            start_prompt="🎙️",
+            stop_prompt="⏹️",
+            key="voice_input",
+            just_once=True,
+        )
+        if audio_data and audio_data.get("bytes"):
+            with st.spinner("🎧 Đang nhận dạng giọng nói..."):
+                stt_result = blaze_stt(audio_data["bytes"])
+                st.session_state.logs.append(f"🔬 Blaze raw: {str(stt_result)[:300]}")
+                # Extract transcription from Blaze response dict
+                if isinstance(stt_result, dict):
+                    inner = stt_result.get("data", {})
+                    st.session_state.logs.append(f"🔑 data type={type(inner).__name__}, keys={list(inner.keys()) if isinstance(inner, dict) else 'N/A'}")
 
-input_query = st.chat_input("Hỏi về độ an toàn (VD: 'Quận 7 tiệm nào rửa kỹ không hại sơn?')")
+                    transcription = ""
+                    # Case 1: data is a dict — try all common transcription keys
+                    if isinstance(inner, dict):
+                        for key in ("transcription", "raw_text", "text", "result", "transcript", "content"):
+                            val = inner.get(key)
+                            if val and isinstance(val, str) and val.strip():
+                                transcription = val.strip()
+                                break
+                    # Case 2: data is a plain string (some APIs return text directly)
+                    elif isinstance(inner, str) and inner.strip():
+                        transcription = inner.strip()
+
+                    # Fallback: check top-level keys too
+                    if not transcription:
+                        for key in ("transcription", "text", "result", "transcript"):
+                            val = stt_result.get(key)
+                            if val and isinstance(val, str) and val.strip():
+                                transcription = val.strip()
+                                break
+
+                    if transcription:
+                        voice_text = transcription
+                    else:
+                        err = stt_result.get("error") or (inner.get("error_message") if isinstance(inner, dict) else None) or "Không có nội dung"
+                        st.session_state.logs.append(f"⚠️ STT no transcription found. Full response keys: {list(stt_result.keys())}")
+                        st.toast(f"Không nhận dạng được: {err}", icon="⚠️")
+                        voice_text = None
+                else:
+                    voice_text = None
+                if voice_text:
+                    st.session_state.logs.append(f"🎙️ STT: {voice_text[:60]}")
+    except ImportError:
+        pass
+
+input_query = st.chat_input("Hỏi về tiệm rửa xe (VD: 'Tiệm nào an toàn nhất ở Tân Bình?')") or pending or voice_text
 
 if input_query:
+    # Ẩn panel chi tiết khi đang xử lý câu hỏi mới
+    st.session_state.selected_shop = None
     st.session_state.messages.append({"role": "user", "content": input_query})
-    with st.chat_message("user"): st.write(input_query)
-    
-    with st.spinner("🕵️ AI đang thực hiện thẩm định chuyên sâu..."):
-        ai_reply_json_str, raw_stores = asyncio.run(call_agent_with_mcp(input_query))
-        
-        try:
-            audit_data = json.loads(ai_reply_json_str)
-            # Tính điểm Overall bằng Evaluator (Toán học dựa trên AI Scores)
-            if "scores" in audit_data and audit_data["scores"]:
-                overall_score = SafeWashEvaluator.calculate_trust_index(audit_data['scores'])
-                display_reply = f"{audit_data.get('comment', '')}\n\n📊 **SafeWash Index: {overall_score}/10**"
-            else:
-                display_reply = audit_data.get('comment', "AI không trả về điểm số thẩm định.")
-        except:
-            display_reply = ai_reply_json_str
+    with st.chat_message("user"):
+        st.write(input_query)
 
-        st.session_state.messages.append({"role": "assistant", "content": display_reply})
-        with st.chat_message("assistant"):
-            st.markdown(display_reply)
-            
-            # Logic TTS (Đã comment lại)
-            # if VOICE_ENABLED:
-            #     audio_bytes = elevenlabs_tts(display_reply)
-            #     if audio_bytes: st.audio(audio_bytes, format="audio/mp3", autoplay=True)
+    with st.spinner("🧠 Đang xử lý qua 3 agent..."):
+        display_text, analyzed_shops, intent_info = run_pipeline(input_query)
+        st.session_state.last_intent = intent_info.get("intent")
 
-    # st.rerun() # Để lại rerun nếu cần UI update tức thì
+    if analyzed_shops:
+        st.session_state.recommendations = analyzed_shops
 
-# --- CARDS: SHOW EVIDENCE ---
+    st.session_state.messages.append({"role": "assistant", "content": display_text})
+    with st.chat_message("assistant"):
+        st.markdown(display_text)
+
+        # Voice output — TTS
+        if st.session_state.voice_enabled and display_text:
+            # Strip markdown for cleaner TTS
+            clean_text = display_text.replace("**", "").replace("##", "").replace("- ", "")
+            tts_text = clean_text[:500]  # Limit length for TTS
+            with st.spinner("🔊 Đang tạo giọng nói..."):
+                audio_bytes = blaze_tts(tts_text)
+            if audio_bytes:
+                st.audio(audio_bytes, format="audio/mp3", autoplay=True)
+
+# ─────────────────────────────────────────────────────────────
+#  SHOP LIST + DETAIL VIEW
+# ─────────────────────────────────────────────────────────────
 if st.session_state.recommendations:
     st.divider()
-    cols = st.columns(min(3, len(st.session_state.recommendations)))
-    for idx, shop in enumerate(st.session_state.recommendations[:3]):
-        with cols[idx]:
-            with st.container(border=True):
-                st.markdown(f"### {shop['name']}")
-                m = shop['metrics']
-                if m['safe'] < 0: st.error("⚠️ HIGH RISK")
-                else: st.success("✅ SafeWash Standard")
-                st.caption(f"📞 {shop['phone']}")
+
+    # --- COLLAPSIBLE SHOP LIST ---
+    shops = st.session_state.recommendations
+    with st.expander(f"🏠 Kết quả đánh giá — {len(shops)} tiệm", expanded=True):
+        for idx, shop in enumerate(shops[:10]):
+            name = shop.get("name", "N/A")
+            m = shop.get("metrics", {})
+            trust = shop.get("_trust") or SafeWashEvaluator.calculate_trust_index(m)
+            risk = shop.get("_risk") or SafeWashEvaluator.risk_label(m)
+
+            # Risk color
+            if risk == "CLOSED":
+                badge = "🚫 Đã đóng"
+            elif risk == "HIGH RISK":
+                badge = f"🟥 {trust}/10"
+            elif risk == "CAUTION":
+                badge = f"🟧 {trust}/10"
+            else:
+                badge = f"🟩 {trust}/10"
+
+            col_name, col_badge, col_btn = st.columns([5, 1.5, 1.5])
+            col_name.markdown(f"**{name}**")
+            col_badge.markdown(badge)
+            if col_btn.button("🔍 Chi tiết", key=f"detail_{idx}", use_container_width=True):
+                st.session_state.selected_shop = idx
+
+    # --- DETAIL VIEW ---
+    sel = st.session_state.selected_shop
+    if sel is not None and sel < len(shops):
+        shop = shops[sel]
+        name = shop.get("name", "N/A")
+        m = shop.get("metrics", {})
+        trust = shop.get("_trust") or SafeWashEvaluator.calculate_trust_index(m)
+        risk = shop.get("_risk") or SafeWashEvaluator.risk_label(m)
+        info = shop.get("additional_info", {})
+
+        st.divider()
+
+        # Header row: name + close button
+        hdr_col, close_col = st.columns([8, 1])
+        hdr_col.subheader(f"🔍 {name}")
+        if close_col.button("✖ Đóng", key="close_detail"):
+            st.session_state.selected_shop = None
+            st.rerun()
+
+        # Trust badge
+        if risk == "CLOSED":
+            st.error("🚫 Đã đóng cửa vĩnh viễn")
+        elif risk == "HIGH RISK":
+            st.markdown(f'<div style="background:#ff4b4b;color:white;padding:10px 16px;border-radius:8px;text-align:center;font-size:1.2em;font-weight:bold;">⚠️ Nguy hiểm — Tin cậy: {trust}/10</div>', unsafe_allow_html=True)
+        elif risk == "CAUTION":
+            st.markdown(f'<div style="background:#ffa726;color:white;padding:10px 16px;border-radius:8px;text-align:center;font-size:1.2em;font-weight:bold;">⚡ Cẩn thận — Tin cậy: {trust}/10</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div style="background:#4caf50;color:white;padding:10px 16px;border-radius:8px;text-align:center;font-size:1.2em;font-weight:bold;">✅ An toàn — Tin cậy: {trust}/10</div>', unsafe_allow_html=True)
+
+        st.write("")
+
+        # --- Info columns ---
+        left, right = st.columns(2)
+
+        with left:
+            st.markdown("#### 📍 Liên hệ & Vị trí")
+            addr = info.get("address", "")
+            phone = shop.get("phone", "")
+            website = shop.get("website")
+            if phone:
+                st.markdown(f"📞 **SĐT:** {phone}")
+            if addr:
+                st.markdown(f"📍 **Địa chỉ:** {addr}")
+            if website:
+                st.markdown(f"🌐 **Website:** [{website}]({website})")
+
+            # Google Maps directions link (uses current position)
+            lat = shop.get("latitude")
+            lng = shop.get("longitude")
+            if lat and lng:
+                maps_url = f"https://www.google.com/maps/dir/?api=1&destination={lat},{lng}"
+                st.markdown(f'[🗺️ Mở Google Maps (chỉ đường từ vị trí của bạn)]({maps_url})')
+
+            # Services
+            services = info.get("services", [])
+            if services:
+                st.markdown("#### 🛠️ Dịch vụ")
+                for svc in services:
+                    st.markdown(f"- {svc}")
+
+        with right:
+            st.markdown("#### 📊 Chi tiết Chỉ số")
+            metric_labels = {
+                "clean": "🧹 Sạch sẽ",
+                "safe": "🛡️ An toàn",
+                "support": "💬 Hỗ trợ",
+                "speed": "⚡ Tốc độ",
+                "price": "💰 Giá cả",
+            }
+            for key, label in metric_labels.items():
+                val = m.get(key, 0)
+                # Map -2..+2 to a visual bar (0-100%)
+                pct = int((val + 2) / 4 * 100)
+                if val > 0:
+                    color = "#4caf50"
+                elif val < 0:
+                    color = "#ff4b4b"
+                else:
+                    color = "#9e9e9e"
+                st.markdown(f"{label} ({val:+d})")
+                st.markdown(f'<div style="background:#e0e0e0;border-radius:4px;height:8px;"><div style="background:{color};width:{pct}%;height:8px;border-radius:4px;"></div></div>', unsafe_allow_html=True)
+                st.write("")
+
+            # Booleans
+            if m.get("multi_service"):
+                st.markdown("✅ Đa dịch vụ")
+            if m.get("is_franchise"):
+                st.markdown("🏢 Chuỗi nhượng quyền")
+
+            # Working hours
+            hours = shop.get("working_hours", {})
+            if hours:
+                st.markdown("#### 🕔 Giờ hoạt động")
+                for day, time in hours.items():
+                    st.markdown(f"**{day}:** {time}")
+
+        # --- Reviews (full width) ---
+        reviews = shop.get("top_reviews", [])
+        if reviews:
+            st.markdown("#### 💬 Đánh giá")
+            for r in reviews:
+                rating = r.get("rating", "")
+                text = r.get("text", "")
+                date = r.get("date", "")
+                owner_resp = r.get("owner_response", "")
+                header = ""
+                if rating:
+                    header += f"⭐ {rating}"
+                if date:
+                    header += f" · {date}"
+                if header:
+                    st.markdown(f"**{header}**")
+                st.markdown(f"> {text}")
+                if owner_resp:
+                    st.markdown(f"💬 **Phản hồi chủ tiệm:** {owner_resp}")
+                images = r.get("images", [])
+                if images:
+                    img_cols = st.columns(min(3, len(images)))
+                    for img_i, img_url in enumerate(images[:3]):
+                        img_cols[img_i].image(img_url, width=200)
+                st.divider()

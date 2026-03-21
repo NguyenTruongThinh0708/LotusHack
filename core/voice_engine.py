@@ -1,39 +1,75 @@
+"""
+Voice Engine — Blaze.vn STT & TTS
+API docs: https://api.blaze.vn
+"""
 import os
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
-API_KEY = os.getenv("ELEVENLABS_API_KEY")
 
-def elevenlabs_stt(audio_bytes):
-    url = "https://api.elevenlabs.io/v1/speech-to-text"
-    headers = {"xi-api-key": API_KEY}
-    # Năm 2026, ElevenLabs yêu cầu chỉ định model_id rõ ràng cho STT
+def _get_api_key():
+    return os.getenv("BLAZE_API_KEY")
+
+
+def _get_stt_url():
+    return os.getenv("BLAZE_STT_URL", "https://api.blaze.vn/v1/stt/execute")
+
+
+def _get_tts_url():
+    return os.getenv("BLAZE_TTS_URL", "https://api.blaze.vn/v1/tts/execute")
+
+def blaze_stt(audio_bytes: bytes) -> dict | str:
+    """Speech-to-Text via Blaze.vn API. Returns full response dict on success."""
+    api_key = _get_api_key()
+    if not api_key:
+        return {"error": "Thiếu BLAZE_API_KEY"}
+    headers = {"Authorization": f"Bearer {api_key}"}
     files = {
-        "file": ("audio.wav", audio_bytes, "audio/wav"),
-        "model_id": (None, "scribe_v1") 
+        "audio_file": ("audio.wav", audio_bytes, "audio/wav"),
     }
     try:
-        response = requests.post(url, headers=headers, files=files)
+        response = requests.post(
+            _get_stt_url(),
+            params={"model": "v1.0"},
+            headers=headers,
+            files=files,
+            timeout=30,
+        )
         if response.status_code == 200:
-            return response.json().get("text", "")
+            return response.json()
         else:
-            return f"Error STT: {response.text}"
+            return {"error": f"Lỗi STT ({response.status_code}): {response.text[:200]}"}
+    except requests.Timeout:
+        return {"error": "Lỗi STT: Quá thời gian chờ"}
     except Exception as e:
-        return f"Lỗi kết nối STT: {str(e)}"
+        return {"error": f"Lỗi kết nối STT: {str(e)}"}
 
-def elevenlabs_tts(text):
-    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "pNInz6obpgDQGcFmaJgB")
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {"xi-api-key": API_KEY, "Content-Type": "application/json"}
-    data = {
-        "text": text,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
-    }
-    response = requests.post(url, json=data, headers=headers)
-    if response.status_code == 200:
-        return response.content
-    else:
-        print(f"TTS Error: {response.text}") # In ra console để debug
+
+def blaze_tts(text: str) -> bytes | None:
+    """Text-to-Speech via Blaze.vn API."""
+    api_key = _get_api_key()
+    if not api_key:
+        return None
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload = {"text": text}
+    try:
+        response = requests.post(
+            _get_tts_url(),
+            params={"model": "v1.0"},
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+        if response.status_code == 200:
+            content_type = response.headers.get("Content-Type", "")
+            if "audio" in content_type:
+                return response.content
+            # If JSON response with audio URL
+            data = response.json()
+            audio_url = data.get("audio_url") or data.get("url") or data.get("result")
+            if audio_url and isinstance(audio_url, str) and audio_url.startswith("http"):
+                audio_resp = requests.get(audio_url, timeout=15)
+                if audio_resp.status_code == 200:
+                    return audio_resp.content
+        return None
+    except Exception:
         return None

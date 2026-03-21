@@ -1,5 +1,14 @@
 # utils/__init__.py
-# Giả sử ông có hàm tính khoảng cách Haversine trong helpers.py
-from .helpers import calculate_distance, format_currency
+from .helpers import (
+    extract_district,
+    safe_json_loads,
+    clamp_score,
+    normalize_ai_scores,
+)
 
-__all__ = ["calculate_distance", "format_currency"]
+__all__ = [
+    "extract_district",
+    "safe_json_loads",
+    "clamp_score",
+    "normalize_ai_scores",
+]
