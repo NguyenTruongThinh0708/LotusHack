@@ -5,6 +5,10 @@ const OSRM_BASE = import.meta.env.VITE_OSRM_BASE || "https://router.project-osrm
 const OSRM_CACHE_TTL_MS = Number(import.meta.env.VITE_OSRM_CACHE_TTL_MS || 10 * 60 * 1000);
 const OSRM_MIN_REQUEST_GAP_MS = Number(import.meta.env.VITE_OSRM_MIN_REQUEST_GAP_MS || 1500);
 const OSRM_COOLDOWN_ON_LIMIT_MS = Number(import.meta.env.VITE_OSRM_COOLDOWN_ON_LIMIT_MS || 30000);
+const TTS_LANG = "vi-VN";
+const TTS_RATE = 1.3;
+const BUSY_TIMELINE_STEP_MIN = 120;
+const BUSY_TIMELINE_SLOTS = 12;
 
 function haversineKm(lat1, lon1, lat2, lon2) {
   const toRad = (v) => (v * Math.PI) / 180;
@@ -28,42 +32,49 @@ function getShopImage(shop) {
   return null;
 }
 
-function flattenAdditionalTags(additionalInfo) {
-  if (!additionalInfo || typeof additionalInfo !== "object") return [];
-  const tags = [];
-  const services = Array.isArray(additionalInfo.services) ? additionalInfo.services : [];
-  const types = Array.isArray(additionalInfo.type) ? additionalInfo.type : [];
-  for (const value of [...services, ...types]) {
-    if (typeof value === "string" && value.trim()) tags.push(value.trim());
-  }
-
-  const extensions = Array.isArray(additionalInfo.extensions) ? additionalInfo.extensions : [];
-  for (const ext of extensions) {
-    if (!ext || typeof ext !== "object") continue;
-    for (const key of Object.keys(ext)) {
-      const values = Array.isArray(ext[key]) ? ext[key] : [];
-      for (const val of values) {
-        if (typeof val === "string" && val.trim()) tags.push(val.trim());
-      }
-    }
-  }
-
-  return tags;
-}
+const CRITERIA_TAG_LABELS = {
+  clean: "Sạch sẽ",
+  speed: "Nhanh",
+  price: "Giá tốt",
+  support: "Hỗ trợ tốt",
+  safe: "An toàn"
+};
 
 function shortenTag(tag) {
   if (tag.length <= 20) return tag;
   return `${tag.slice(0, 19).trim()}…`;
 }
 
-function buildShopTags(shop) {
-  const collected = flattenAdditionalTags(shop?.additional_info).map(shortenTag);
-  if (shop?.metrics?.is_franchise) collected.push("Franchise");
-  if (shop?.metrics?.multi_service) collected.push("Đa dịch vụ");
+function buildCriteriaTagsFromMetrics(shop) {
+  const metrics =
+    shop?.metrics && typeof shop.metrics === "object"
+      ? shop.metrics
+      : shop?.store_metrics && typeof shop.store_metrics === "object"
+        ? shop.store_metrics
+        : {};
 
-  const unique = [...new Set(collected.filter(Boolean))].slice(0, 3);
-  if (unique.length === 0) return ["Tag", "Tag", "Tag"];
-  if (unique.length === 1) return [...unique, "Tag"];
+  let hasCriteriaMetric = false;
+  const tags = [];
+  for (const [key, label] of Object.entries(CRITERIA_TAG_LABELS)) {
+    const score = Number(metrics?.[key]);
+    if (!Number.isFinite(score)) continue;
+    hasCriteriaMetric = true;
+    if (score >= 1) {
+      tags.push(label);
+    }
+  }
+  return { tags, hasCriteriaMetric };
+}
+
+function buildShopTags(shop) {
+  const tagsFromBackend = Array.isArray(shop?.tags)
+    ? shop.tags.filter((tag) => typeof tag === "string" && tag.trim()).map((tag) => tag.trim())
+    : [];
+  const { tags: criteriaTags, hasCriteriaMetric } = buildCriteriaTagsFromMetrics(shop);
+  const finalTags = hasCriteriaMetric ? criteriaTags : tagsFromBackend;
+
+  const unique = [...new Set(finalTags.map(shortenTag))].slice(0, 3);
+  if (unique.length === 0) return ["Chưa có tag"];
   return unique;
 }
 
@@ -133,6 +144,18 @@ function parseBusynessTimeToMinutes(timeLabel) {
   return Number.isFinite(value) ? value : null;
 }
 
+function formatMinuteLabel(minute) {
+  if (!Number.isFinite(minute)) return "";
+  const total = ((Math.round(minute) % 1440) + 1440) % 1440;
+  let hour = Math.floor(total / 60);
+  const minutePart = total % 60;
+  const meridiem = hour >= 12 ? "PM" : "AM";
+  hour %= 12;
+  if (hour === 0) hour = 12;
+  if (minutePart === 0) return `${hour} ${meridiem}`;
+  return `${hour}:${String(minutePart).padStart(2, "0")} ${meridiem}`;
+}
+
 function getTodayName(now = new Date()) {
   return now.toLocaleDateString("en-US", { weekday: "long" });
 }
@@ -151,19 +174,63 @@ function getTodayBusynessSeries(shop, now = new Date()) {
   return rows;
 }
 
-function compactSeries(series, maxPoints = 12) {
-  if (series.length <= maxPoints) return series;
+function buildFixedTimelineSlots() {
   const output = [];
-  const step = (series.length - 1) / (maxPoints - 1);
-  const used = new Set();
-  for (let i = 0; i < maxPoints; i += 1) {
-    const idx = Math.round(i * step);
-    if (!used.has(idx)) {
-      output.push(series[idx]);
-      used.add(idx);
-    }
+  for (let i = 0; i < BUSY_TIMELINE_SLOTS; i += 1) {
+    const minute = i * BUSY_TIMELINE_STEP_MIN;
+    output.push({ minute, time: formatMinuteLabel(minute) });
   }
   return output;
+}
+
+function buildFixedBusynessSeries(shop, now = new Date()) {
+  const todaySeries = getTodayBusynessSeries(shop, now);
+  const slots = buildFixedTimelineSlots();
+  if (!todaySeries.length) {
+    return slots.map((slot) => ({
+      minute: slot.minute,
+      time: slot.time,
+      percent: 0,
+      hasData: false
+    }));
+  }
+
+  const byMinute = new Map(todaySeries.map((item) => [item.minute, item]));
+  return slots.map((slot) => {
+    const exact = byMinute.get(slot.minute);
+    if (exact) {
+      return {
+        minute: slot.minute,
+        time: slot.time,
+        percent: exact.percent,
+        hasData: true
+      };
+    }
+
+    let nearest = null;
+    let bestDiff = Number.POSITIVE_INFINITY;
+    for (const point of todaySeries) {
+      const diff = Math.abs(point.minute - slot.minute);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        nearest = point;
+      }
+    }
+    if (nearest && bestDiff <= 45) {
+      return {
+        minute: slot.minute,
+        time: slot.time,
+        percent: nearest.percent,
+        hasData: true
+      };
+    }
+    return {
+      minute: slot.minute,
+      time: slot.time,
+      percent: 0,
+      hasData: false
+    };
+  });
 }
 
 function findClosestBusynessIndex(series, now = new Date()) {
@@ -227,22 +294,10 @@ function buildMapsDirectionUrl(shop, userCoords) {
 }
 
 function BusynessMiniChart({ shop, now }) {
-  const today = getTodayBusynessSeries(shop, now);
-  const series = compactSeries(today, 12);
+  const series = buildFixedBusynessSeries(shop, now);
+  const hasAnyData = series.some((point) => point.hasData);
   const currentIdx = findClosestBusynessIndex(series, now);
-  const currentPoint = currentIdx >= 0 ? series[currentIdx] : null;
-
-  if (!series.length) {
-    return (
-      <div className="busy-wrap">
-        <div className="busy-header">
-          <span>Mức độ đông hôm nay</span>
-          <strong>--</strong>
-        </div>
-        <p className="busy-empty">Chưa có dữ liệu busyness cho hôm nay.</p>
-      </div>
-    );
-  }
+  const currentPoint = currentIdx >= 0 && series[currentIdx]?.hasData ? series[currentIdx] : null;
 
   return (
     <div className="busy-wrap">
@@ -252,21 +307,23 @@ function BusynessMiniChart({ shop, now }) {
       </div>
       <div className="busy-chart" role="img" aria-label="Biểu đồ mức độ đông trong ngày">
         {series.map((point, idx) => {
-          const h = 8 + Math.round((point.percent / 100) * 28);
+          const h = point.hasData ? 8 + Math.round((point.percent / 100) * 28) : 8;
           return (
             <span
               key={`${point.time}-${idx}`}
-              className={`busy-bar ${idx === currentIdx ? "current" : ""}`}
+              className={`busy-bar ${point.hasData ? "" : "missing"} ${idx === currentIdx && point.hasData ? "current" : ""}`.trim()}
               style={{ height: `${h}px` }}
-              title={`${point.time} • ${point.percent}%`}
+              title={point.hasData ? `${point.time} • ${point.percent}%` : `${point.time} • No data`}
             />
           );
         })}
       </div>
       <div className="busy-scale">
         <span>{series[0]?.time || ""}</span>
+        <span>{series[Math.floor(series.length / 2)]?.time || ""}</span>
         <span>{series[series.length - 1]?.time || ""}</span>
       </div>
+      {!hasAnyData && <p className="busy-empty">Chưa có dữ liệu busyness cho hôm nay.</p>}
     </div>
   );
 }
@@ -310,10 +367,9 @@ function App() {
   const [messages, setMessages] = useState([
     {
       role: "assistant",
-      content: "Xin chào, mình là SafeWash AI. Bạn có thể nhập câu hỏi hoặc dùng voice để bắt đầu."
+      content: "Xin chào, mình là WashGo AI. Bạn có thể dùng voice để bắt đầu."
     }
   ]);
-  const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [shops, setShops] = useState([]);
   const [recording, setRecording] = useState(false);
@@ -331,6 +387,10 @@ function App() {
   const osrmDebounceRef = useRef(null);
   const osrmLastRequestAtRef = useRef(0);
   const osrmCooldownUntilRef = useRef(0);
+  const speechUtteranceRef = useRef(null);
+  const ttsAbortRef = useRef(null);
+  const ttsAudioRef = useRef(null);
+  const ttsAudioUrlRef = useRef("");
 
   useEffect(() => {
     const applyMode = () => {
@@ -407,8 +467,6 @@ function App() {
   }, []);
 
   const now = useMemo(() => new Date(clockTick), [clockTick]);
-  const canSend = useMemo(() => input.trim().length > 0 && !loading, [input, loading]);
-
   const topShops = useMemo(() => {
     return [...shops]
       .sort((a, b) => Number(b?._trust ?? 0) - Number(a?._trust ?? 0))
@@ -417,6 +475,23 @@ function App() {
 
   useEffect(() => {
     return () => {
+      if (window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
+      if (ttsAbortRef.current) {
+        ttsAbortRef.current.abort();
+        ttsAbortRef.current = null;
+      }
+      if (ttsAudioRef.current) {
+        try {
+          ttsAudioRef.current.pause();
+        } catch {}
+        ttsAudioRef.current = null;
+      }
+      if (ttsAudioUrlRef.current) {
+        URL.revokeObjectURL(ttsAudioUrlRef.current);
+        ttsAudioUrlRef.current = "";
+      }
       if (osrmDebounceRef.current) {
         clearTimeout(osrmDebounceRef.current);
         osrmDebounceRef.current = null;
@@ -427,6 +502,103 @@ function App() {
       }
     };
   }, []);
+
+  function stopTtsPlayback() {
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+    if (ttsAbortRef.current) {
+      ttsAbortRef.current.abort();
+      ttsAbortRef.current = null;
+    }
+    if (ttsAudioRef.current) {
+      try {
+        ttsAudioRef.current.pause();
+      } catch {}
+      ttsAudioRef.current = null;
+    }
+    if (ttsAudioUrlRef.current) {
+      URL.revokeObjectURL(ttsAudioUrlRef.current);
+      ttsAudioUrlRef.current = "";
+    }
+    speechUtteranceRef.current = null;
+  }
+
+  function pickVietnameseVoice() {
+    if (!window.speechSynthesis) return null;
+    const voices = window.speechSynthesis.getVoices() || [];
+    if (!voices.length) return null;
+    return (
+      voices.find((v) => String(v.lang || "").toLowerCase() === "vi-vn") ||
+      voices.find((v) => String(v.lang || "").toLowerCase().startsWith("vi")) ||
+      null
+    );
+  }
+
+  async function speakViaServerTts(text) {
+    const content = String(text || "").trim();
+    if (!content) return false;
+
+    try {
+      const controller = new AbortController();
+      ttsAbortRef.current = controller;
+      const resp = await fetch(`${API_BASE}/api/voice/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: content }),
+        signal: controller.signal
+      });
+      if (!resp.ok) return false;
+
+      const blob = await resp.blob();
+      if (!blob || blob.size === 0) return false;
+      const audioUrl = URL.createObjectURL(blob);
+      ttsAudioUrlRef.current = audioUrl;
+
+      const audio = new Audio(audioUrl);
+      audio.playbackRate = TTS_RATE;
+      ttsAudioRef.current = audio;
+      audio.onended = () => {
+        if (ttsAudioUrlRef.current) {
+          URL.revokeObjectURL(ttsAudioUrlRef.current);
+          ttsAudioUrlRef.current = "";
+        }
+        ttsAudioRef.current = null;
+      };
+      await audio.play();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      ttsAbortRef.current = null;
+    }
+  }
+
+  async function speakAssistantReply(text) {
+    const content = String(text || "").trim();
+    if (!content) {
+      return;
+    }
+    stopTtsPlayback();
+
+    const canBrowserTts = window.speechSynthesis && typeof SpeechSynthesisUtterance !== "undefined";
+    if (canBrowserTts) {
+      const viVoice = pickVietnameseVoice();
+      if (viVoice) {
+        const utterance = new SpeechSynthesisUtterance(content);
+        utterance.lang = TTS_LANG;
+        utterance.rate = TTS_RATE;
+        utterance.pitch = 1;
+        utterance.volume = 1;
+        utterance.voice = viVoice;
+        speechUtteranceRef.current = utterance;
+        window.speechSynthesis.speak(utterance);
+        return;
+      }
+    }
+
+    await speakViaServerTts(content);
+  }
 
   useEffect(() => {
     if (!userCoords || topShops.length === 0) {
@@ -535,7 +707,6 @@ function App() {
   async function sendMessage(text) {
     const msg = text.trim();
     if (!msg) return;
-    setInput("");
     setLoading(true);
     setMessages((prev) => [...prev, { role: "user", content: msg }]);
 
@@ -548,7 +719,9 @@ function App() {
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.detail || "Chat API failed");
 
-      setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
+      const assistantReply = String(data.reply || "").trim();
+      setMessages((prev) => [...prev, { role: "assistant", content: assistantReply }]);
+      void speakAssistantReply(assistantReply);
       setShops(Array.isArray(data.shops) ? data.shops : []);
       setSelectedShop(null);
     } catch (err) {
@@ -587,6 +760,7 @@ function App() {
   }
 
   async function startRecording() {
+    stopTtsPlayback();
     if (!navigator.mediaDevices?.getUserMedia) {
       setMessages((prev) => [
         ...prev,
@@ -635,13 +809,6 @@ function App() {
     }
   }
 
-  function onInputKeyDown(e) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      if (canSend) sendMessage(input);
-    }
-  }
-
   const mapsUrl = selectedShop ? buildMapsDirectionUrl(selectedShop, userCoords) : null;
   const selectedRouteMeters = selectedShop
     ? routeDistanceByShop[shopDistanceKey(selectedShop)]
@@ -651,8 +818,8 @@ function App() {
     <div className={`app-shell mode-${uiMode}`}>
       <header className="app-header">
         <div>
-          <h1>SafeWash Assistant</h1>
-          <p>Chat by text or voice • Engine: {sttEngine}</p>
+          <h1>WashGo Assistant</h1>
+          <p>Voice-only mode • Engine: {sttEngine}</p>
         </div>
       </header>
 
@@ -670,29 +837,29 @@ function App() {
                 ))}
                 {loading && (
                   <article className="message-row assistant">
-                    <div className="message-bubble assistant typing">SafeWash đang phân tích...</div>
+                    <div className="message-bubble assistant typing">WashGo đang phân tích...</div>
                   </article>
                 )}
               </div>
 
-              <div className="input-bar">
+              <div className="voice-dock">
                 <button
                   className={`mic-btn ${recording ? "recording" : ""}`}
                   onClick={recording ? stopRecording : startRecording}
                   aria-label="Voice action"
                   title="Voice action"
                 >
-                  {recording ? "⏹" : "🎙"}
+                  {recording ? (
+                    <span className="mic-stop-icon" aria-hidden="true" />
+                  ) : (
+                    <svg className="mic-icon" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M12 15a3 3 0 0 0 3-3V7a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Z" />
+                      <path d="M18 11.5a1 1 0 1 0-2 0 4 4 0 1 1-8 0 1 1 0 1 0-2 0 6 6 0 0 0 5 5.91V20H9a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.59A6 6 0 0 0 18 11.5Z" />
+                    </svg>
+                  )}
                 </button>
-                <textarea
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={onInputKeyDown}
-                  rows={1}
-                  placeholder="Nhập câu hỏi của bạn..."
-                />
               </div>
-              <p className="input-hint">Enter để gửi • Shift + Enter để xuống dòng</p>
+              <p className="voice-hint">Nhấn mic để nói với assistant.</p>
 
               {uiMode === "phone" && (
                 <section className="phone-suggestions">

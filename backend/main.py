@@ -10,11 +10,10 @@ from fastapi.responses import JSONResponse, Response
 
 from backend.schemas import ChatRequest, ChatResponse, ErrorResponse, STTResponse, TTSRequest
 from core.pipeline_service import SafeWashPipeline
-from core.voice_engine import blaze_stt, blaze_tts, openai_stt
-
+from core.voice_engine import blaze_stt, blaze_tts, openai_stt, openai_tts
 load_dotenv()
 
-app = FastAPI(title="SafeWash API", version="1.0.0")
+app = FastAPI(title="WashGo API", version="1.0.0")
 pipeline = SafeWashPipeline()
 BACKEND_HOST = os.getenv("BACKEND_HOST", "0.0.0.0")
 BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
@@ -172,6 +171,8 @@ async def stt(audio_file: UploadFile = File(...)) -> STTResponse:
 )
 async def tts(payload: TTSRequest):
     audio = blaze_tts(payload.text)
+    if not audio:
+        audio = openai_tts(payload.text)
     if not audio:
         return JSONResponse(status_code=400, content={"detail": "TTS failed"})
     return Response(content=audio, media_type="audio/mpeg")

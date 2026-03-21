@@ -1,5 +1,5 @@
 """
-Multi-agent system for SafeWash AI.
+Multi-agent system for WashGo AI.
 
 Agents:
   1. RouterAgent   — Phân loại intent của user, quyết định gọi tool nào
@@ -76,14 +76,17 @@ def analyze_shops(shops_json: str, sort_order: str = "best", apply_threshold: bo
 def advise(user_message: str, analyzed_data: list[dict], intent_info: dict) -> dict:
     """Generate final user-facing response."""
     # Trim data to reduce token cost — keep top 8 shops max for context
+    is_recommend = intent_info.get("intent") == "recommend"
+    is_worst_mode = intent_info.get("sort_order", "best") == "worst"
+    max_context_shops = 2 if is_recommend and not is_worst_mode else 8
+
     trimmed = []
-    for s in analyzed_data[:8]:
+    for s in analyzed_data[:max_context_shops]:
         trimmed.append({
             "name": s.get("name"),
             "phone": s.get("phone"),
             "address": s.get("additional_info", {}).get("address", ""),
             "metrics": s.get("metrics"),
-            "trust_index": s.get("_trust"),
             "risk_label": s.get("_risk"),
             "working_hours": s.get("working_hours"),
             "busyness_sample": (s.get("busyness") or [])[:6],

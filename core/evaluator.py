@@ -19,7 +19,7 @@ class SafeWashEvaluator:
     @staticmethod
     def calculate_trust_index(metrics: dict) -> float:
         r"""
-        Tính SafeWash Trust Index (0-10) từ metrics scale -2..+2.
+        Tính WashGo Trust Index (0-10) từ metrics scale -2..+2.
 
         Công thức:
         1. Chuẩn hoá mỗi metric từ [-2, +2] về [0, 1]:  norm = (value + 2) / 4

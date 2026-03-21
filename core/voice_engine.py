@@ -133,3 +133,54 @@ def blaze_tts(text: str) -> bytes | None:
         return None
     except Exception:
         return None
+
+
+def _read_openai_audio_response(resp) -> bytes | None:
+    if resp is None:
+        return None
+
+    try:
+        data = resp.read()
+        if isinstance(data, (bytes, bytearray)) and data:
+            return bytes(data)
+    except Exception:
+        pass
+
+    content = getattr(resp, "content", None)
+    if isinstance(content, (bytes, bytearray)) and content:
+        return bytes(content)
+    return None
+
+
+def openai_tts(text: str) -> bytes | None:
+    """Fallback Text-to-Speech via OpenAI; tuned to read Vietnamese naturally."""
+    client = _get_openai_stt_client()
+    if client is None:
+        return None
+
+    content = str(text or "").strip()
+    if not content:
+        return None
+
+    model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+    voice = os.getenv("OPENAI_TTS_VOICE", "alloy")
+    try:
+        speed = float(os.getenv("OPENAI_TTS_SPEED", "1.5"))
+    except Exception:
+        speed = 1.5
+    speed = max(0.25, min(4.0, speed))
+    instructions = os.getenv(
+        "OPENAI_TTS_INSTRUCTIONS",
+        "Nói tiếng Việt tự nhiên theo ngữ điệu người Việt (vi-VN), rõ câu, không đánh vần từng ký tự.",
+    )
+    try:
+        resp = client.audio.speech.create(
+            model=model,
+            voice=voice,
+            input=content,
+            instructions=instructions,
+            speed=speed,
+        )
+        return _read_openai_audio_response(resp)
+    except Exception:
+        return None

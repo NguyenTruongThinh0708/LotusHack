@@ -1,4 +1,4 @@
-# LotusHack - SafeWash AI
+# LotusHack - WashGo AI
 
 This project now supports two UI modes:
 
@@ -42,6 +42,19 @@ OPENAI_API_KEY=...
 
 # Optional voice provider (STT/TTS)
 BLAZE_API_KEY=...
+```
+
+MongoDB source for shop data (required):
+
+```bash
+MONGODB_URI=mongodb+srv://<user>:<pass>@<cluster>/<db>?retryWrites=true&w=majority
+MONGODB_DB=washgo
+MONGODB_COLLECTION=stores
+MONGODB_BOOKING_COLLECTION=bookings
+# optional fallback candidates for auto-detecting store collection
+MONGODB_COLLECTION_CANDIDATES=stores,shops,all_shops,all_shops_final
+# optional (default=3000)
+MONGODB_TIMEOUT_MS=3000
 ```
 
 3. Check health:

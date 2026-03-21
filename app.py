@@ -37,7 +37,7 @@ server_params = StdioServerParameters(
 )
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="SafeWash AI - Đánh Giá Rửa Xe", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="WashGo AI - Đánh Giá Rửa Xe", page_icon="🛡️", layout="wide")
 
 # --- SESSION STATE ---
 if "messages" not in st.session_state:
@@ -159,7 +159,7 @@ def run_pipeline(user_message: str) -> tuple[str, list[dict], dict]:
     if scores:
         norm_scores = normalize_ai_scores({"scores": scores})
         trust = SafeWashEvaluator.calculate_trust_index(norm_scores)
-        parts.append(f"\n📊 **Chỉ số Tin cậy SafeWash: {trust}/10**")
+        parts.append(f"\n📊 **Chỉ số Tin cậy WashGo: {trust}/10**")
 
     display_text = "\n".join(parts)
     return display_text, analyzed, intent_info
@@ -172,7 +172,7 @@ def run_pipeline(user_message: str) -> tuple[str, list[dict], dict]:
 # --- SIDEBAR ---
 with st.sidebar:
     st.image("https://img.icons8.com/fluency/96/car-wash.png", width=64)
-    st.title("SafeWash AI")
+    st.title("WashGo AI")
     st.caption("Hệ thống đánh giá an toàn tiệm rửa xe thông minh")
     st.divider()
 
@@ -224,7 +224,7 @@ with st.sidebar:
         st.rerun()
 
 # --- HEADER ---
-st.title("🛡️ SafeWash AI: Chuyên gia Đánh giá")
+st.title("🛡️ WashGo AI: Chuyên gia Đánh giá")
 
 if st.session_state.last_intent:
     intent_map = {
