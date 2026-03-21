@@ -10,7 +10,7 @@ import nest_asyncio
 from pathlib import Path
 from dotenv import load_dotenv
 
-# CRITICAL: load .env BEFORE any core imports (agents.py needs OPENROUTER_API_KEY)
+# CRITICAL: load .env BEFORE any core imports (agents.py needs OPENAI_API_KEY)
 load_dotenv()
 nest_asyncio.apply()
 
@@ -25,8 +25,8 @@ from core.voice_engine import blaze_stt, blaze_tts, openai_stt
 from utils.helpers import safe_json_loads, normalize_ai_scores
 
 # --- CONFIG ---
-if not os.getenv("OPENROUTER_API_KEY"):
-    st.error("⚠️ Thiếu OPENROUTER_API_KEY trong .env. Vui lòng cấu hình trước khi chạy.")
+if not os.getenv("OPENAI_API_KEY"):
+    st.error("⚠️ Thiếu OPENAI_API_KEY trong .env. Vui lòng cấu hình trước khi chạy.")
     st.stop()
 
 SERVER_SCRIPT = Path(__file__).parent / "server" / "mcp_server.py"

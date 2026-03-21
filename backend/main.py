@@ -94,7 +94,6 @@ def extract_blaze_text(stt_result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]
 async def health() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "openrouter_key_set": bool(os.getenv("OPENROUTER_API_KEY")),
         "blaze_key_set": bool(os.getenv("BLAZE_API_KEY")),
         "openai_key_set": bool(os.getenv("OPENAI_API_KEY")),
     }
@@ -106,8 +105,8 @@ async def health() -> Dict[str, Any]:
     responses={500: {"model": ErrorResponse}},
 )
 async def chat(payload: ChatRequest) -> ChatResponse:
-    if not os.getenv("OPENROUTER_API_KEY"):
-        raise HTTPException(status_code=500, detail="Missing OPENROUTER_API_KEY")
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(status_code=500, detail="Missing OPENAI_API_KEY")
 
     result = await pipeline.run_async(payload.message)
     return ChatResponse(

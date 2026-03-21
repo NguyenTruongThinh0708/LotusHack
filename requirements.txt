@@ -3,7 +3,7 @@ streamlit>=1.42.0
 mcp[cli]>=1.2.0
 nest_asyncio>=1.6.0
 
-# --- AI & LLM (OpenRouter) ---
+# --- AI & LLM (OpenAI) ---
 openai>=1.60.0
 python-dotenv>=1.0.1
 

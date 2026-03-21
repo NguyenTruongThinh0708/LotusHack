@@ -34,6 +34,16 @@ BACKEND_PORT=8000
 BACKEND_RELOAD=true
 ```
 
+Required/optional API keys:
+
+```bash
+# Required for Router/Advisor/Tips agents
+OPENAI_API_KEY=...
+
+# Optional voice provider (STT/TTS)
+BLAZE_API_KEY=...
+```
+
 3. Check health:
 
 ```bash

@@ -13,17 +13,14 @@ import os
 from openai import OpenAI
 from core.evaluator import SafeWashEvaluator
 from core.prompts import ROUTER_PROMPT, ADVISOR_PROMPT, TIPS_PROMPT
-from utils.helpers import safe_json_loads, normalize_ai_scores
+from utils.helpers import safe_json_loads
 
 _client = None
 
 def _get_client() -> OpenAI:
     global _client
     if _client is None:
-        _client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.getenv("OPENROUTER_API_KEY"),
-        )
+        _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     return _client
 
 
@@ -33,7 +30,7 @@ def _get_client() -> OpenAI:
 def route(user_message: str) -> dict:
     """Classify user intent + extract entities."""
     resp = _get_client().chat.completions.create(
-        model="openai/gpt-4o-mini",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": ROUTER_PROMPT},
             {"role": "user", "content": user_message},
@@ -106,7 +103,7 @@ def advise(user_message: str, analyzed_data: list[dict], intent_info: dict) -> d
     }, ensure_ascii=False)
 
     resp = _get_client().chat.completions.create(
-        model="openai/gpt-4o",
+        model="gpt-4o",
         messages=[
             {"role": "system", "content": ADVISOR_PROMPT},
             {"role": "user", "content": user_payload},
@@ -121,7 +118,7 @@ def advise(user_message: str, analyzed_data: list[dict], intent_info: dict) -> d
 # ---------------------------------------------------------------------------
 def general_tips(user_message: str) -> dict:
     resp = _get_client().chat.completions.create(
-        model="openai/gpt-4o-mini",
+        model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": TIPS_PROMPT},
             {"role": "user", "content": user_message},

@@ -1,20 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
-
-function riskLabel(risk) {
-  if (risk === "HIGH RISK") return "Nguy hiểm";
-  if (risk === "CAUTION") return "Cần lưu ý";
-  if (risk === "CLOSED") return "Đã đóng";
-  return "An toàn";
-}
-
-function riskTone(risk) {
-  if (risk === "HIGH RISK") return "danger";
-  if (risk === "CAUTION") return "warning";
-  if (risk === "CLOSED") return "muted";
-  return "safe";
-}
+const OSRM_BASE = import.meta.env.VITE_OSRM_BASE || "https://router.project-osrm.org";
+const OSRM_CACHE_TTL_MS = Number(import.meta.env.VITE_OSRM_CACHE_TTL_MS || 10 * 60 * 1000);
+const OSRM_MIN_REQUEST_GAP_MS = Number(import.meta.env.VITE_OSRM_MIN_REQUEST_GAP_MS || 1500);
+const OSRM_COOLDOWN_ON_LIMIT_MS = Number(import.meta.env.VITE_OSRM_COOLDOWN_ON_LIMIT_MS || 30000);
 
 function haversineKm(lat1, lon1, lat2, lon2) {
   const toRad = (v) => (v * Math.PI) / 180;
@@ -38,45 +28,281 @@ function getShopImage(shop) {
   return null;
 }
 
-function buildShopTags(shop) {
+function flattenAdditionalTags(additionalInfo) {
+  if (!additionalInfo || typeof additionalInfo !== "object") return [];
   const tags = [];
-  const services = Array.isArray(shop?.additional_info?.services) ? shop.additional_info.services : [];
-  for (const service of services) {
-    if (typeof service === "string" && service.trim()) {
-      tags.push(service.trim());
-    }
-    if (tags.length >= 2) break;
+  const services = Array.isArray(additionalInfo.services) ? additionalInfo.services : [];
+  const types = Array.isArray(additionalInfo.type) ? additionalInfo.type : [];
+  for (const value of [...services, ...types]) {
+    if (typeof value === "string" && value.trim()) tags.push(value.trim());
   }
 
-  if (shop?.metrics?.is_franchise) tags.push("Franchise");
-  if (shop?.metrics?.multi_service) tags.push("Multi Service");
-  if (shop?._risk) tags.push(riskLabel(shop._risk));
+  const extensions = Array.isArray(additionalInfo.extensions) ? additionalInfo.extensions : [];
+  for (const ext of extensions) {
+    if (!ext || typeof ext !== "object") continue;
+    for (const key of Object.keys(ext)) {
+      const values = Array.isArray(ext[key]) ? ext[key] : [];
+      for (const val of values) {
+        if (typeof val === "string" && val.trim()) tags.push(val.trim());
+      }
+    }
+  }
 
-  const unique = [...new Set(tags.filter(Boolean))].slice(0, 3);
+  return tags;
+}
+
+function shortenTag(tag) {
+  if (tag.length <= 20) return tag;
+  return `${tag.slice(0, 19).trim()}…`;
+}
+
+function buildShopTags(shop) {
+  const collected = flattenAdditionalTags(shop?.additional_info).map(shortenTag);
+  if (shop?.metrics?.is_franchise) collected.push("Franchise");
+  if (shop?.metrics?.multi_service) collected.push("Đa dịch vụ");
+
+  const unique = [...new Set(collected.filter(Boolean))].slice(0, 3);
   if (unique.length === 0) return ["Tag", "Tag", "Tag"];
   if (unique.length === 1) return [...unique, "Tag"];
   return unique;
 }
 
-function formatDistanceKm(shop, userCoords) {
-  const lat = Number(shop?.latitude);
-  const lng = Number(shop?.longitude);
-  if (!Number.isFinite(lat) || !Number.isFinite(lng) || !userCoords) {
-    return "Bật GPS";
+function parseTimeTokenToMinutes(token) {
+  if (typeof token !== "string") return null;
+  const m = token.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
+  if (!m) return null;
+  let hour = Number(m[1]);
+  const minute = Number(m[2] || 0);
+  const meridiem = String(m[3]).toUpperCase();
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  if (hour < 1 || hour > 12 || minute < 0 || minute > 59) return null;
+  if (meridiem === "AM") {
+    if (hour === 12) hour = 0;
+  } else if (hour !== 12) {
+    hour += 12;
   }
-  const km = haversineKm(userCoords.lat, userCoords.lng, lat, lng);
-  if (!Number.isFinite(km) || km > 120) return "-- km";
-  if (km < 1) return `${Math.max(1, Math.round(km * 1000))} m`;
-  if ((userCoords.accuracy ?? 0) > 1000) return `~${km.toFixed(1)} km`;
-  return `${km.toFixed(1)} km`;
+  return hour * 60 + minute;
 }
 
-function getWorkingHoursPreview(shop) {
+function parseWorkingWindow(rangeText) {
+  if (typeof rangeText !== "string") return null;
+  const text = rangeText.trim();
+  if (!text) return null;
+
+  const lower = text.toLowerCase();
+  if (lower.includes("open 24 hours")) return { allDay: true };
+  if (lower.includes("closed")) return { closed: true };
+
+  const normalized = text.replace(/â€“/g, "-").replace(/[–—−]/g, "-");
+  const matches = [...normalized.matchAll(/(\d{1,2}(?::\d{2})?\s*(?:AM|PM))/gi)];
+  if (matches.length < 2) return null;
+
+  const openMin = parseTimeTokenToMinutes(matches[0][1]);
+  const closeMin = parseTimeTokenToMinutes(matches[1][1]);
+  if (openMin == null || closeMin == null) return null;
+
+  return { openMin, closeMin };
+}
+
+function isShopClosedNow(shop, now = new Date()) {
+  if (shop?.metrics?.is_closed) return true;
   const hours = shop?.working_hours;
-  if (!hours || typeof hours !== "object") return "N/A";
-  const pairs = Object.entries(hours).slice(0, 3);
-  if (pairs.length === 0) return "N/A";
-  return pairs.map(([day, time]) => `${day}: ${time}`).join(" • ");
+  if (!hours || typeof hours !== "object") return false;
+
+  const day = now.toLocaleDateString("en-US", { weekday: "long" });
+  const rawRange = hours[day];
+  const parsed = parseWorkingWindow(rawRange);
+  if (!parsed) return false;
+  if (parsed.allDay) return false;
+  if (parsed.closed) return true;
+
+  const currentMin = now.getHours() * 60 + now.getMinutes();
+  const openMin = parsed.openMin;
+  const closeMin = parsed.closeMin;
+
+  if (openMin === closeMin) return false;
+  if (openMin < closeMin) {
+    return !(currentMin >= openMin && currentMin < closeMin);
+  }
+  return !(currentMin >= openMin || currentMin < closeMin);
+}
+
+function parseBusynessTimeToMinutes(timeLabel) {
+  if (typeof timeLabel !== "string") return null;
+  const value = parseTimeTokenToMinutes(timeLabel.trim().toUpperCase());
+  return Number.isFinite(value) ? value : null;
+}
+
+function getTodayName(now = new Date()) {
+  return now.toLocaleDateString("en-US", { weekday: "long" });
+}
+
+function getTodayBusynessSeries(shop, now = new Date()) {
+  const all = Array.isArray(shop?.busyness) ? shop.busyness : [];
+  const dayName = getTodayName(now);
+  const rows = all
+    .filter((item) => item?.day === dayName)
+    .map((item) => ({
+      time: item?.time || "",
+      percent: Math.max(0, Math.min(100, Number(item?.percent) || 0)),
+      minute: parseBusynessTimeToMinutes(item?.time || "")
+    }))
+    .filter((item) => Number.isFinite(item.minute));
+  return rows;
+}
+
+function compactSeries(series, maxPoints = 12) {
+  if (series.length <= maxPoints) return series;
+  const output = [];
+  const step = (series.length - 1) / (maxPoints - 1);
+  const used = new Set();
+  for (let i = 0; i < maxPoints; i += 1) {
+    const idx = Math.round(i * step);
+    if (!used.has(idx)) {
+      output.push(series[idx]);
+      used.add(idx);
+    }
+  }
+  return output;
+}
+
+function findClosestBusynessIndex(series, now = new Date()) {
+  if (!series.length) return -1;
+  const current = now.getHours() * 60 + now.getMinutes();
+  let bestIdx = 0;
+  let bestDiff = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < series.length; i += 1) {
+    const linear = Math.abs(series[i].minute - current);
+    const diff = Math.min(linear, 1440 - linear);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+function shopDistanceKey(shop) {
+  const lat = Number(shop?.latitude);
+  const lng = Number(shop?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return `${lat.toFixed(6)},${lng.toFixed(6)}`;
+}
+
+function formatMeters(meters, approximate = false) {
+  if (!Number.isFinite(meters) || meters <= 0) return "-- km";
+  if (meters < 1000) return `${Math.max(1, Math.round(meters))} m`;
+  const km = meters / 1000;
+  return `${approximate ? "~" : ""}${km.toFixed(1)} km`;
+}
+
+function formatDistanceKm(shop, userCoords, routeMeters) {
+  if (Number.isFinite(routeMeters)) {
+    return formatMeters(routeMeters, false);
+  }
+
+  const lat = Number(shop?.latitude);
+  const lng = Number(shop?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return "N/A";
+  if (!userCoords) return "Đang lấy vị trí";
+
+  const km = haversineKm(userCoords.lat, userCoords.lng, lat, lng);
+  if (!Number.isFinite(km)) return "-- km";
+  if (km > 150) return "-- km";
+  const approximate = (userCoords.accuracy ?? 0) > 1000;
+  return formatMeters(km * 1000, approximate);
+}
+
+function buildMapsDirectionUrl(shop, userCoords) {
+  const lat = Number(shop?.latitude);
+  const lng = Number(shop?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const base = "https://www.google.com/maps/dir/?api=1";
+  const destination = `destination=${encodeURIComponent(`${lat},${lng}`)}`;
+  if (userCoords && Number.isFinite(userCoords.lat) && Number.isFinite(userCoords.lng)) {
+    const origin = `origin=${encodeURIComponent(`${userCoords.lat},${userCoords.lng}`)}`;
+    return `${base}&${origin}&${destination}&travelmode=driving`;
+  }
+  return `${base}&${destination}&travelmode=driving`;
+}
+
+function BusynessMiniChart({ shop, now }) {
+  const today = getTodayBusynessSeries(shop, now);
+  const series = compactSeries(today, 12);
+  const currentIdx = findClosestBusynessIndex(series, now);
+  const currentPoint = currentIdx >= 0 ? series[currentIdx] : null;
+
+  if (!series.length) {
+    return (
+      <div className="busy-wrap">
+        <div className="busy-header">
+          <span>Mức độ đông hôm nay</span>
+          <strong>--</strong>
+        </div>
+        <p className="busy-empty">Chưa có dữ liệu busyness cho hôm nay.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="busy-wrap">
+      <div className="busy-header">
+        <span>Mức độ đông hôm nay</span>
+        <strong>{currentPoint ? `${currentPoint.percent}%` : "--"}</strong>
+      </div>
+      <div className="busy-chart" role="img" aria-label="Biểu đồ mức độ đông trong ngày">
+        {series.map((point, idx) => {
+          const h = 8 + Math.round((point.percent / 100) * 28);
+          return (
+            <span
+              key={`${point.time}-${idx}`}
+              className={`busy-bar ${idx === currentIdx ? "current" : ""}`}
+              style={{ height: `${h}px` }}
+              title={`${point.time} • ${point.percent}%`}
+            />
+          );
+        })}
+      </div>
+      <div className="busy-scale">
+        <span>{series[0]?.time || ""}</span>
+        <span>{series[series.length - 1]?.time || ""}</span>
+      </div>
+    </div>
+  );
+}
+
+function SuggestionCard({ shop, userCoords, routeMeters, now, onSelect }) {
+  const tags = buildShopTags(shop);
+  const closedNow = isShopClosedNow(shop, now);
+  const image = getShopImage(shop);
+
+  return (
+    <article className="suggest-row" onClick={onSelect}>
+      <div className="suggest-left">
+        <div className="suggest-thumb">
+          {image ? <img src={image} alt={shop?.name || "shop"} loading="lazy" /> : <span>No Image</span>}
+        </div>
+        <div className="suggest-content">
+          <h4>{shop?.name || "N/A"}</h4>
+          <div className="suggest-meta">
+            <small className="distance-text">{formatDistanceKm(shop, userCoords, routeMeters)}</small>
+            {closedNow && <span className="closed-pill">Đã đóng cửa</span>}
+          </div>
+          <div className="tag-frame">
+            <div className="tag-row">
+              {tags.map((tag, idx) => (
+                <span key={`${tag}-${idx}`} className="tag-chip">
+                  #{tag}
+                </span>
+              ))}
+            </div>
+          </div>
+          <BusynessMiniChart shop={shop} now={now} />
+        </div>
+      </div>
+      <span className="suggest-arrow">›</span>
+    </article>
+  );
 }
 
 function App() {
@@ -94,10 +320,17 @@ function App() {
   const [sttEngine, setSttEngine] = useState("Blaze");
   const [userCoords, setUserCoords] = useState(null);
   const [selectedShop, setSelectedShop] = useState(null);
+  const [clockTick, setClockTick] = useState(Date.now());
+  const [routeDistanceByShop, setRouteDistanceByShop] = useState({});
 
   const recorderRef = useRef(null);
   const streamRef = useRef(null);
   const chunksRef = useRef([]);
+  const osrmCacheRef = useRef(new Map());
+  const osrmAbortRef = useRef(null);
+  const osrmDebounceRef = useRef(null);
+  const osrmLastRequestAtRef = useRef(0);
+  const osrmCooldownUntilRef = useRef(0);
 
   useEffect(() => {
     const applyMode = () => {
@@ -106,6 +339,13 @@ function App() {
     applyMode();
     window.addEventListener("resize", applyMode);
     return () => window.removeEventListener("resize", applyMode);
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setClockTick(Date.now());
+    }, 60_000);
+    return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
@@ -120,9 +360,7 @@ function App() {
           });
         }
       },
-      () => {
-        setUserCoords(null);
-      },
+      () => setUserCoords(null),
       {
         enableHighAccuracy: true,
         timeout: 7000,
@@ -132,7 +370,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!navigator.geolocation) return;
+    if (!navigator.geolocation) return undefined;
     const watchId = navigator.geolocation.watchPosition(
       (pos) => {
         const next = {
@@ -141,7 +379,13 @@ function App() {
           accuracy: pos.coords.accuracy
         };
         if ((next.accuracy ?? 9999) <= 1500) {
-          setUserCoords(next);
+          setUserCoords((prev) => {
+            if (!prev) return next;
+            const movedKm = haversineKm(prev.lat, prev.lng, next.lat, next.lng);
+            const accuracyImproved = (prev.accuracy ?? 9999) - (next.accuracy ?? 9999) > 120;
+            if (movedKm < 0.06 && !accuracyImproved) return prev;
+            return next;
+          });
         }
       },
       () => {},
@@ -156,14 +400,13 @@ function App() {
 
   useEffect(() => {
     const onKeyDown = (e) => {
-      if (e.key === "Escape") {
-        setSelectedShop(null);
-      }
+      if (e.key === "Escape") setSelectedShop(null);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  const now = useMemo(() => new Date(clockTick), [clockTick]);
   const canSend = useMemo(() => input.trim().length > 0 && !loading, [input, loading]);
 
   const topShops = useMemo(() => {
@@ -171,6 +414,123 @@ function App() {
       .sort((a, b) => Number(b?._trust ?? 0) - Number(a?._trust ?? 0))
       .slice(0, 4);
   }, [shops]);
+
+  useEffect(() => {
+    return () => {
+      if (osrmDebounceRef.current) {
+        clearTimeout(osrmDebounceRef.current);
+        osrmDebounceRef.current = null;
+      }
+      if (osrmAbortRef.current) {
+        osrmAbortRef.current.abort();
+        osrmAbortRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!userCoords || topShops.length === 0) {
+      setRouteDistanceByShop({});
+      return;
+    }
+
+    if (osrmDebounceRef.current) {
+      clearTimeout(osrmDebounceRef.current);
+      osrmDebounceRef.current = null;
+    }
+    if (osrmAbortRef.current) {
+      osrmAbortRef.current.abort();
+      osrmAbortRef.current = null;
+    }
+
+    const nowTs = Date.now();
+    const originKey = `${userCoords.lat.toFixed(3)},${userCoords.lng.toFixed(3)}`;
+    const cachedDistances = {};
+    const unresolved = [];
+
+    for (const shop of topShops) {
+      const key = shopDistanceKey(shop);
+      const cacheKey = `${originKey}|${key}`;
+      const lat = Number(shop?.latitude);
+      const lng = Number(shop?.longitude);
+      if (!key || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+
+      const cached = osrmCacheRef.current.get(cacheKey);
+      if (cached && cached.expiresAt > nowTs && Number.isFinite(cached.meters)) {
+        cachedDistances[key] = cached.meters;
+      } else {
+        unresolved.push({ key, cacheKey, lat, lng });
+      }
+    }
+
+    setRouteDistanceByShop(cachedDistances);
+    if (!unresolved.length) return;
+    if (nowTs < osrmCooldownUntilRef.current) return;
+
+    const waitForGap = Math.max(
+      0,
+      osrmLastRequestAtRef.current + OSRM_MIN_REQUEST_GAP_MS - nowTs
+    );
+    if (osrmDebounceRef.current) clearTimeout(osrmDebounceRef.current);
+
+    osrmDebounceRef.current = setTimeout(async () => {
+      if (Date.now() < osrmCooldownUntilRef.current) return;
+
+      if (osrmAbortRef.current) {
+        osrmAbortRef.current.abort();
+      }
+
+      const controller = new AbortController();
+      osrmAbortRef.current = controller;
+
+      try {
+        const source = `${userCoords.lng},${userCoords.lat}`;
+        const destinationString = unresolved.map((item) => `${item.lng},${item.lat}`).join(";");
+        const coordinates = `${source};${destinationString}`;
+        const endpoint = `${OSRM_BASE}/table/v1/driving/${coordinates}?sources=0&annotations=distance`;
+
+        osrmLastRequestAtRef.current = Date.now();
+        const resp = await fetch(endpoint, { signal: controller.signal });
+        if (resp.status === 429) {
+          osrmCooldownUntilRef.current = Date.now() + OSRM_COOLDOWN_ON_LIMIT_MS;
+          return;
+        }
+        if (!resp.ok) {
+          throw new Error(`OSRM request failed (${resp.status})`);
+        }
+
+        const data = await resp.json();
+        const row = Array.isArray(data?.distances?.[0]) ? data.distances[0] : null;
+        if (!row) return;
+
+        const merged = {};
+        const expiresAt = Date.now() + OSRM_CACHE_TTL_MS;
+        for (let i = 0; i < unresolved.length; i += 1) {
+          const meters = Number(row[i + 1]);
+          if (Number.isFinite(meters) && meters > 0) {
+            merged[unresolved[i].key] = meters;
+            osrmCacheRef.current.set(unresolved[i].cacheKey, { meters, expiresAt });
+          } else {
+            osrmCacheRef.current.set(unresolved[i].cacheKey, {
+              meters: Number.NaN,
+              expiresAt: Date.now() + 60_000
+            });
+          }
+        }
+
+        if (Object.keys(merged).length) {
+          setRouteDistanceByShop((prev) => ({ ...prev, ...merged }));
+        }
+      } catch (err) {
+        if (err?.name === "AbortError") return;
+        osrmCooldownUntilRef.current = Date.now() + 5000;
+      } finally {
+        if (osrmAbortRef.current === controller) {
+          osrmAbortRef.current = null;
+        }
+      }
+    }, 350 + waitForGap);
+  }, [topShops, userCoords]);
 
   async function sendMessage(text) {
     const msg = text.trim();
@@ -186,9 +546,7 @@ function App() {
         body: JSON.stringify({ message: msg })
       });
       const data = await resp.json();
-      if (!resp.ok) {
-        throw new Error(data.detail || "Chat API failed");
-      }
+      if (!resp.ok) throw new Error(data.detail || "Chat API failed");
 
       setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
       setShops(Array.isArray(data.shops) ? data.shops : []);
@@ -214,15 +572,11 @@ function App() {
         body: form
       });
       const data = await resp.json();
-      if (!resp.ok) {
-        throw new Error(data.detail || "STT failed");
-      }
+      if (!resp.ok) throw new Error(data.detail || "STT failed");
 
       const transcript = (data.text || "").trim();
       setSttEngine(data.engine || "Unknown");
-      if (transcript) {
-        await sendMessage(transcript);
-      }
+      if (transcript) await sendMessage(transcript);
     } catch (err) {
       const detail = err instanceof Error ? err.message : "Unknown error";
       setMessages((prev) => [
@@ -284,11 +638,14 @@ function App() {
   function onInputKeyDown(e) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      if (canSend) {
-        sendMessage(input);
-      }
+      if (canSend) sendMessage(input);
     }
   }
+
+  const mapsUrl = selectedShop ? buildMapsDirectionUrl(selectedShop, userCoords) : null;
+  const selectedRouteMeters = selectedShop
+    ? routeDistanceByShop[shopDistanceKey(selectedShop)]
+    : undefined;
 
   return (
     <div className={`app-shell mode-${uiMode}`}>
@@ -342,39 +699,16 @@ function App() {
                   <h3>Top Shop Suggestions</h3>
                   <div className="phone-shop-scroll">
                     {topShops.length === 0 && <p className="muted">Chưa có dữ liệu.</p>}
-                    {topShops.map((shop, idx) => {
-                      const img = getShopImage(shop);
-                      const tags = buildShopTags(shop);
-                      return (
-                        <article key={`${shop.name}-${idx}`} className="suggest-row" onClick={() => setSelectedShop(shop)}>
-                          <div className="suggest-left">
-                            <div className="suggest-thumb">
-                              {img ? <img src={img} alt={shop.name || "shop"} loading="lazy" /> : <span>No Image</span>}
-                            </div>
-                            <div className="suggest-content">
-                              <h4>{shop.name || "N/A"}</h4>
-                              <div className="suggest-meta">
-                                <small className="distance-text">{formatDistanceKm(shop, userCoords)}</small>
-                                <span className="meta-dot">•</span>
-                                <span className={`status-pill ${riskTone(shop._risk)}`}>
-                                  {riskLabel(shop._risk)}
-                                </span>
-                              </div>
-                              <div className="tag-frame">
-                                <div className="tag-row">
-                                  {tags.map((tag, i) => (
-                                    <span key={`${tag}-${i}`} className="tag-chip">
-                                      #{tag}
-                                    </span>
-                                  ))}
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                          <span className="suggest-arrow">›</span>
-                        </article>
-                      );
-                    })}
+                    {topShops.map((shop, idx) => (
+                      <SuggestionCard
+                        key={`${shop?.name || "shop"}-${idx}`}
+                        shop={shop}
+                        userCoords={userCoords}
+                        routeMeters={routeDistanceByShop[shopDistanceKey(shop)]}
+                        now={now}
+                        onSelect={() => setSelectedShop(shop)}
+                      />
+                    ))}
                   </div>
                 </section>
               )}
@@ -385,39 +719,16 @@ function App() {
                 <h2>Top 4 Shop Suggestions</h2>
                 <div className="car-shop-list">
                   {topShops.length === 0 && <p className="muted">Chưa có dữ liệu.</p>}
-                  {topShops.map((shop, idx) => {
-                    const img = getShopImage(shop);
-                    const tags = buildShopTags(shop);
-                    return (
-                      <article key={`${shop.name}-${idx}`} className="suggest-row" onClick={() => setSelectedShop(shop)}>
-                        <div className="suggest-left">
-                          <div className="suggest-thumb">
-                            {img ? <img src={img} alt={shop.name || "shop"} loading="lazy" /> : <span>No Image</span>}
-                          </div>
-                          <div className="suggest-content">
-                            <h4>{shop.name || "N/A"}</h4>
-                            <div className="suggest-meta">
-                              <small className="distance-text">{formatDistanceKm(shop, userCoords)}</small>
-                              <span className="meta-dot">•</span>
-                              <span className={`status-pill ${riskTone(shop._risk)}`}>
-                                {riskLabel(shop._risk)}
-                              </span>
-                            </div>
-                            <div className="tag-frame">
-                              <div className="tag-row">
-                                {tags.map((tag, i) => (
-                                  <span key={`${tag}-${i}`} className="tag-chip">
-                                    #{tag}
-                                  </span>
-                                ))}
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                        <span className="suggest-arrow">›</span>
-                      </article>
-                    );
-                  })}
+                  {topShops.map((shop, idx) => (
+                    <SuggestionCard
+                      key={`${shop?.name || "shop"}-${idx}`}
+                      shop={shop}
+                      userCoords={userCoords}
+                      routeMeters={routeDistanceByShop[shopDistanceKey(shop)]}
+                      now={now}
+                      onSelect={() => setSelectedShop(shop)}
+                    />
+                  ))}
                 </div>
               </aside>
             )}
@@ -429,26 +740,27 @@ function App() {
         <div className="shop-modal-backdrop" onClick={() => setSelectedShop(null)}>
           <section className="shop-modal" onClick={(e) => e.stopPropagation()}>
             <div className="shop-modal-head">
-              <h3>{selectedShop.name || "N/A"}</h3>
+              <h3>{selectedShop?.name || "N/A"}</h3>
               <p>Tap outside to close</p>
             </div>
             <div className="shop-modal-top">
               <div className="shop-modal-image">
                 {getShopImage(selectedShop) ? (
-                  <img src={getShopImage(selectedShop)} alt={selectedShop.name || "shop"} />
+                  <img src={getShopImage(selectedShop)} alt={selectedShop?.name || "shop"} />
                 ) : (
                   <span>No Image</span>
                 )}
               </div>
               <div className="shop-modal-metrics">
                 <div>
-                  <span>Risk</span>
-                  <strong>{riskLabel(selectedShop._risk)}</strong>
+                  <span>Khoảng cách</span>
+                  <strong>{formatDistanceKm(selectedShop, userCoords, selectedRouteMeters)}</strong>
                 </div>
                 <div>
-                  <span>Distance</span>
-                  <strong>{formatDistanceKm(selectedShop, userCoords)}</strong>
+                  <span>Trạng thái</span>
+                  <strong>{isShopClosedNow(selectedShop, now) ? "Đã đóng cửa" : "Đang mở cửa"}</strong>
                 </div>
+                <BusynessMiniChart shop={selectedShop} now={now} />
               </div>
             </div>
             <div className="shop-modal-tags">
@@ -460,23 +772,34 @@ function App() {
             </div>
             <div className="shop-modal-info">
               <p>
-                <strong>Phone:</strong> {selectedShop.phone || "N/A"}
+                <strong>Phone:</strong> {selectedShop?.phone || "N/A"}
               </p>
               <p>
-                <strong>Website:</strong> {selectedShop.website || "N/A"}
+                <strong>Website:</strong>{" "}
+                {selectedShop?.website ? (
+                  <a href={selectedShop.website} target="_blank" rel="noreferrer">
+                    {selectedShop.website}
+                  </a>
+                ) : (
+                  "N/A"
+                )}
               </p>
               <p>
-                <strong>Services:</strong>{" "}
+                <strong>Dịch vụ:</strong>{" "}
                 {Array.isArray(selectedShop?.additional_info?.services) &&
                 selectedShop.additional_info.services.length > 0
                   ? selectedShop.additional_info.services.slice(0, 5).join(", ")
                   : "N/A"}
               </p>
               <p>
-                <strong>Working hours:</strong> {getWorkingHoursPreview(selectedShop)}
-              </p>
-              <p>
-                <strong>Coordinates:</strong> {selectedShop.latitude ?? "N/A"}, {selectedShop.longitude ?? "N/A"}
+                <strong>Google Maps:</strong>{" "}
+                {mapsUrl ? (
+                  <a href={mapsUrl} target="_blank" rel="noreferrer" className="map-link">
+                    Chỉ đường từ vị trí hiện tại
+                  </a>
+                ) : (
+                  "Không có tọa độ cửa hàng"
+                )}
               </p>
             </div>
           </section>
