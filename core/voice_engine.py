@@ -3,7 +3,9 @@ Voice Engine — Blaze.vn STT & TTS
 API docs: https://api.blaze.vn
 """
 import os
+import io
 import requests
+from openai import OpenAI
 
 
 def _get_api_key():
@@ -17,14 +19,37 @@ def _get_stt_url():
 def _get_tts_url():
     return os.getenv("BLAZE_TTS_URL", "https://api.blaze.vn/v1/tts/execute")
 
-def blaze_stt(audio_bytes: bytes) -> dict | str:
+
+_openai_stt_client = None
+
+
+def _get_openai_stt_client():
+    global _openai_stt_client
+    if _openai_stt_client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        _openai_stt_client = OpenAI(api_key=api_key)
+    return _openai_stt_client
+
+def blaze_stt(audio_bytes: bytes, audio_format: str = "wav") -> dict | str:
     """Speech-to-Text via Blaze.vn API. Returns full response dict on success."""
     api_key = _get_api_key()
     if not api_key:
         return {"error": "Thiếu BLAZE_API_KEY"}
     headers = {"Authorization": f"Bearer {api_key}"}
+    fmt = (audio_format or "wav").lower().strip(".")
+    if fmt in ("mp3", "mpeg"):
+        content_type = "audio/mpeg"
+    elif fmt in ("webm",):
+        content_type = "audio/webm"
+    elif fmt in ("ogg",):
+        content_type = "audio/ogg"
+    else:
+        fmt = "wav"
+        content_type = "audio/wav"
     files = {
-        "audio_file": ("audio.wav", audio_bytes, "audio/wav"),
+        "audio_file": (f"audio.{fmt}", audio_bytes, content_type),
     }
     try:
         response = requests.post(
@@ -42,6 +67,41 @@ def blaze_stt(audio_bytes: bytes) -> dict | str:
         return {"error": "Lỗi STT: Quá thời gian chờ"}
     except Exception as e:
         return {"error": f"Lỗi kết nối STT: {str(e)}"}
+
+
+def openai_stt(audio_bytes: bytes, audio_format: str = "wav") -> dict:
+    """Fallback STT via OpenAI when Blaze returns empty/low-confidence text."""
+    client = _get_openai_stt_client()
+    if client is None:
+        return {"error": "Thiếu OPENAI_API_KEY"}
+
+    fmt = (audio_format or "wav").lower().strip(".")
+    if fmt not in ("wav", "mp3", "mpeg", "webm", "ogg", "m4a"):
+        fmt = "wav"
+
+    primary_model = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
+    models = [primary_model]
+    if primary_model != "whisper-1":
+        models.append("whisper-1")
+
+    last_error = None
+    for model_name in models:
+        try:
+            buffer = io.BytesIO(audio_bytes)
+            buffer.name = f"audio.{fmt}"
+            resp = client.audio.transcriptions.create(
+                model=model_name,
+                file=buffer,
+            )
+            text = getattr(resp, "text", None)
+            if not text and isinstance(resp, dict):
+                text = resp.get("text")
+            if text and isinstance(text, str) and text.strip():
+                return {"text": text.strip(), "model": model_name}
+            last_error = "OpenAI STT returned empty transcription"
+        except Exception as e:
+            last_error = str(e)
+    return {"error": last_error or "OpenAI STT failed"}
 
 
 def blaze_tts(text: str) -> bytes | None:

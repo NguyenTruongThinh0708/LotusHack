@@ -11,6 +11,9 @@ python-dotenv>=1.0.1
 requests>=2.32.3
 pydantic>=2.10.0
 pandas>=2.2.3
+fastapi>=0.116.0
+uvicorn[standard]>=0.35.0
+python-multipart>=0.0.20
 
 # --- Audio & Voice (Fixed Version) ---
 streamlit-mic-recorder==0.0.8

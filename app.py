@@ -3,6 +3,9 @@ import os
 import asyncio
 import json
 import sys
+import io
+import wave
+import hashlib
 import nest_asyncio
 from pathlib import Path
 from dotenv import load_dotenv
@@ -18,7 +21,7 @@ from mcp.client.stdio import stdio_client
 # Core
 from core.evaluator import SafeWashEvaluator
 from core.agents import route, analyze_shops, advise, general_tips
-from core.voice_engine import blaze_stt, blaze_tts
+from core.voice_engine import blaze_stt, blaze_tts, openai_stt
 from utils.helpers import safe_json_loads, normalize_ai_scores
 
 # --- CONFIG ---
@@ -49,6 +52,20 @@ if "voice_enabled" not in st.session_state:
     st.session_state.voice_enabled = bool(os.getenv("BLAZE_API_KEY"))
 if "selected_shop" not in st.session_state:
     st.session_state.selected_shop = None
+if "last_mic_signature" not in st.session_state:
+    st.session_state.last_mic_signature = None
+if "last_stt_engine" not in st.session_state:
+    st.session_state.last_stt_engine = None
+
+
+def estimate_wav_duration_seconds(audio_bytes: bytes) -> float | None:
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate() or 1
+            return round(frames / float(rate), 2)
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -165,6 +182,8 @@ with st.sidebar:
         st.session_state.voice_enabled = st.toggle(
             "🎙️ Giọng nói", value=st.session_state.voice_enabled
         )
+        if st.session_state.last_stt_engine:
+            st.caption(f"STT gần nhất: {st.session_state.last_stt_engine}")
     else:
         st.session_state.voice_enabled = False
 
@@ -174,7 +193,7 @@ with st.sidebar:
     - **Router Agent** — Phân loại ý định
     - **Analyst Agent** — Chấm điểm & phân tích
     - **Advisor Agent** — Tư vấn & đề xuất
-    - **Voice Agent** — STT ↔ TTS (ElevenLabs)
+    - **Voice Agent** — STT (Blaze + OpenAI fallback) ↔ TTS
     """)
     st.divider()
 
@@ -200,6 +219,8 @@ with st.sidebar:
         st.session_state.logs = []
         st.session_state.last_intent = None
         st.session_state.selected_shop = None
+        st.session_state.last_mic_signature = None
+        st.session_state.last_stt_engine = None
         st.rerun()
 
 # --- HEADER ---
@@ -233,48 +254,125 @@ if st.session_state.voice_enabled:
             start_prompt="🎙️",
             stop_prompt="⏹️",
             key="voice_input",
-            just_once=True,
+            just_once=False,
+            format="wav",
         )
         if audio_data and audio_data.get("bytes"):
-            with st.spinner("🎧 Đang nhận dạng giọng nói..."):
-                stt_result = blaze_stt(audio_data["bytes"])
-                st.session_state.logs.append(f"🔬 Blaze raw: {str(stt_result)[:300]}")
-                # Extract transcription from Blaze response dict
-                if isinstance(stt_result, dict):
-                    inner = stt_result.get("data", {})
-                    st.session_state.logs.append(f"🔑 data type={type(inner).__name__}, keys={list(inner.keys()) if isinstance(inner, dict) else 'N/A'}")
+            audio_bytes = audio_data.get("bytes", b"")
+            audio_hash = hashlib.sha1(audio_bytes).hexdigest()[:16] if audio_bytes else "none"
+            audio_signature = f"{audio_data.get('id')}:{audio_hash}"
 
-                    transcription = ""
-                    # Case 1: data is a dict — try all common transcription keys
-                    if isinstance(inner, dict):
-                        for key in ("transcription", "raw_text", "text", "result", "transcript", "content"):
-                            val = inner.get(key)
-                            if val and isinstance(val, str) and val.strip():
-                                transcription = val.strip()
-                                break
-                    # Case 2: data is a plain string (some APIs return text directly)
-                    elif isinstance(inner, str) and inner.strip():
-                        transcription = inner.strip()
+            if audio_signature != st.session_state.last_mic_signature:
+                st.session_state.last_mic_signature = audio_signature
+                with st.spinner("🎧 Đang nhận dạng giọng nói..."):
+                    audio_seconds = estimate_wav_duration_seconds(audio_bytes)
+                    st.session_state.logs.append(
+                        f"🎛️ Mic meta: id={audio_data.get('id')}, format={audio_data.get('format')}, bytes={len(audio_bytes)}, seconds={audio_seconds}"
+                    )
+                    audio_format = str(audio_data.get("format", "wav")).lower()
+                    stt_result = blaze_stt(audio_bytes, audio_format=audio_format)
+                    stt_engine = "Blaze"
+                    st.session_state.logs.append(f"🔬 Blaze raw: {str(stt_result)[:300]}")
+                    # Extract transcription from Blaze response dict
+                    if isinstance(stt_result, dict):
+                        result_obj = stt_result.get("result")
+                        inner = None
+                        source = "unknown"
 
-                    # Fallback: check top-level keys too
-                    if not transcription:
-                        for key in ("transcription", "text", "result", "transcript"):
-                            val = stt_result.get(key)
-                            if val and isinstance(val, str) and val.strip():
-                                transcription = val.strip()
-                                break
+                        # Blaze often nests transcription at result.data.*
+                        if isinstance(result_obj, dict) and isinstance(result_obj.get("data"), dict):
+                            inner = result_obj.get("data")
+                            source = "result.data"
+                        elif isinstance(stt_result.get("data"), dict):
+                            inner = stt_result.get("data")
+                            source = "data"
+                        elif isinstance(result_obj, dict):
+                            inner = result_obj
+                            source = "result"
+                        elif isinstance(stt_result.get("data"), str):
+                            inner = stt_result.get("data")
+                            source = "data(string)"
+                        else:
+                            inner = {}
 
-                    if transcription:
-                        voice_text = transcription
+                        st.session_state.logs.append(
+                            f"🔑 parse from={source}, data type={type(inner).__name__}, keys={list(inner.keys()) if isinstance(inner, dict) else 'N/A'}"
+                        )
+
+                        transcription = ""
+                        # Case 1: data is a dict — try all common transcription keys
+                        if isinstance(inner, dict):
+                            for key in ("transcription", "raw_text", "text", "result", "transcript", "content"):
+                                val = inner.get(key)
+                                if val and isinstance(val, str) and val.strip():
+                                    transcription = val.strip()
+                                    break
+                        # Case 2: data is a plain string (some APIs return text directly)
+                        elif isinstance(inner, str) and inner.strip():
+                            transcription = inner.strip()
+
+                        # Fallback: check top-level and nested result keys too
+                        if not transcription:
+                            for key in ("transcription", "text", "result", "transcript"):
+                                val = stt_result.get(key)
+                                if val and isinstance(val, str) and val.strip():
+                                    transcription = val.strip()
+                                    break
+                        if not transcription and isinstance(result_obj, dict):
+                            for key in ("transcription", "raw_text", "text", "transcript", "content"):
+                                val = result_obj.get(key)
+                                if val and isinstance(val, str) and val.strip():
+                                    transcription = val.strip()
+                                    break
+
+                        if transcription:
+                            # If transcript is too short for a long audio clip, try fallback STT.
+                            words = len(transcription.split())
+                            likely_truncated = bool(audio_seconds and audio_seconds >= 3.0 and words <= 1)
+                            if likely_truncated:
+                                st.session_state.logs.append(
+                                    f"⚠️ Blaze transcript may be truncated (words={words}, seconds={audio_seconds}), trying fallback..."
+                                )
+                                fb = openai_stt(audio_bytes, audio_format=audio_format)
+                                fb_text = fb.get("text") if isinstance(fb, dict) else None
+                                if fb_text:
+                                    voice_text = fb_text
+                                    stt_engine = f"OpenAI ({fb.get('model', 'unknown')})"
+                                    st.session_state.logs.append(
+                                        f"🛟 Fallback STT ({fb.get('model', 'unknown')}): {voice_text[:60]}"
+                                    )
+                                else:
+                                    voice_text = transcription
+                                    st.session_state.logs.append(
+                                        f"ℹ️ Fallback STT unavailable: {(fb.get('error') if isinstance(fb, dict) else 'unknown error')}"
+                                    )
+                            else:
+                                voice_text = transcription
+                        else:
+                            fb = openai_stt(audio_bytes, audio_format=audio_format)
+                            fb_text = fb.get("text") if isinstance(fb, dict) else None
+                            if fb_text:
+                                voice_text = fb_text
+                                stt_engine = f"OpenAI ({fb.get('model', 'unknown')})"
+                                st.session_state.logs.append(
+                                    f"🛟 Fallback STT ({fb.get('model', 'unknown')}): {voice_text[:60]}"
+                                )
+                            else:
+                                err = (
+                                    stt_result.get("error")
+                                    or (inner.get("error_message") if isinstance(inner, dict) else None)
+                                    or (result_obj.get("error") if isinstance(result_obj, dict) else None)
+                                    or "Không có nội dung"
+                                )
+                                st.session_state.logs.append(f"⚠️ STT no transcription found. Full response keys: {list(stt_result.keys())}")
+                                st.toast(f"Không nhận dạng được: {err}", icon="⚠️")
+                                voice_text = None
                     else:
-                        err = stt_result.get("error") or (inner.get("error_message") if isinstance(inner, dict) else None) or "Không có nội dung"
-                        st.session_state.logs.append(f"⚠️ STT no transcription found. Full response keys: {list(stt_result.keys())}")
-                        st.toast(f"Không nhận dạng được: {err}", icon="⚠️")
                         voice_text = None
-                else:
-                    voice_text = None
-                if voice_text:
-                    st.session_state.logs.append(f"🎙️ STT: {voice_text[:60]}")
+
+                    if voice_text:
+                        st.session_state.last_stt_engine = stt_engine
+                        st.session_state.logs.append(f"🎙️ STT ({stt_engine}): {voice_text[:60]}")
     except ImportError:
         pass
 
