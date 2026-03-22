@@ -519,13 +519,31 @@ class SafeWashPipeline:
 
         if not analyzed:
             location = (intent_info.get("location") or "").strip()
+            requested_tags = intent_info.get("requested_tags") or []
+            tag_labels = [
+                TAG_DISPLAY_LABELS.get(str(tag), str(tag))
+                for tag in requested_tags
+                if str(tag).strip()
+            ]
             if intent_info.get("intent") == "recommend" and location:
-                not_found_text = (
-                    f"Không tìm thấy tiệm nào khớp khu vực '{location}' trong dữ liệu hiện tại. "
-                    "Bạn thử khu vực lân cận hoặc nhập tên quận/huyện khác nhé."
-                )
+                if tag_labels:
+                    not_found_text = (
+                        f"Không tìm thấy tiệm khớp khu vực '{location}' với tiêu chí tag: {', '.join(tag_labels)}. "
+                        "Bạn thử nới tiêu chí hoặc đổi khu vực nhé."
+                    )
+                else:
+                    not_found_text = (
+                        f"Không tìm thấy tiệm nào khớp khu vực '{location}' trong dữ liệu hiện tại. "
+                        "Bạn thử khu vực lân cận hoặc nhập tên quận/huyện khác nhé."
+                    )
             else:
-                not_found_text = "Không tìm thấy tiệm phù hợp. Hãy thử hỏi theo khu vực hoặc tên tiệm cụ thể."
+                if tag_labels:
+                    not_found_text = (
+                        f"Không tìm thấy tiệm phù hợp với tag: {', '.join(tag_labels)}. "
+                        "Bạn thử đổi tiêu chí (ví dụ sạch/nhanh/giá tốt) hoặc thêm khu vực nhé."
+                    )
+                else:
+                    not_found_text = "Không tìm thấy tiệm phù hợp. Hãy thử hỏi theo khu vực hoặc tên tiệm cụ thể."
             return PipelineResult(
                 display_text=not_found_text,
                 shops=[],

@@ -105,6 +105,48 @@ function getShopImage(shop) {
   return null;
 }
 
+function getReviewText(review) {
+  if (!review || typeof review !== "object") return "";
+  const raw = String(review.text || review.comment || "").trim();
+  return raw;
+}
+
+function shortenReview(text, maxLen = 84) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  if (clean.length <= maxLen) return clean;
+  return `${clean.slice(0, maxLen - 1).trim()}…`;
+}
+
+function buildShopReviewMeta(shop) {
+  const reviews = Array.isArray(shop?.top_reviews) ? shop.top_reviews : [];
+  const totalReviewsRaw = Number(shop?.reviews);
+  const totalReviews = Number.isFinite(totalReviewsRaw)
+    ? Math.max(0, Math.round(totalReviewsRaw))
+    : reviews.length;
+
+  let totalLikes = 0;
+  for (const review of reviews) {
+    const likes = Number(review?.likes);
+    if (Number.isFinite(likes) && likes > 0) totalLikes += likes;
+  }
+
+  const snippets = [];
+  for (const review of reviews) {
+    const snippet = shortenReview(getReviewText(review));
+    if (!snippet) continue;
+    if (snippets.includes(snippet)) continue;
+    snippets.push(snippet);
+    if (snippets.length >= 2) break;
+  }
+
+  return {
+    totalReviews,
+    totalLikes,
+    snippets
+  };
+}
+
 const CRITERIA_TAG_LABELS = {
   clean: "Sạch sẽ",
   speed: "Nhanh",
@@ -440,6 +482,7 @@ function SuggestionCard({ shop, userCoords, routeMeters, now, onSelect }) {
   const tags = buildShopTags(shop);
   const closedNow = isShopClosedNow(shop, now);
   const image = getShopImage(shop);
+  const reviewMeta = buildShopReviewMeta(shop);
 
   return (
     <article className="suggest-row" onClick={onSelect}>
@@ -462,6 +505,19 @@ function SuggestionCard({ shop, userCoords, routeMeters, now, onSelect }) {
               ))}
             </div>
           </div>
+          <div className="suggest-social">
+            <span className="social-chip">Reviews: {reviewMeta.totalReviews}</span>
+            {reviewMeta.totalLikes > 0 && <span className="social-chip">Likes: {reviewMeta.totalLikes}</span>}
+          </div>
+          {reviewMeta.snippets.length > 0 && (
+            <div className="suggest-comments">
+              {reviewMeta.snippets.map((snippet, idx) => (
+                <p key={`${shop?.name || "shop"}-review-${idx}`} className="suggest-comment-line">
+                  “{snippet}”
+                </p>
+              ))}
+            </div>
+          )}
           <BusynessMiniChart shop={shop} now={now} />
         </div>
       </div>

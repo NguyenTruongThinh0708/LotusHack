@@ -642,18 +642,55 @@ def _parse_12h_time_to_minutes(token: str) -> int | None:
 
 def _parse_time_from_text(text: str) -> int | None:
     cleaned = str(text or "").replace("\u202f", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    lower = cleaned.lower()
+    word_norm = unicodedata.normalize("NFD", lower)
+    word_norm = "".join(ch for ch in word_norm if unicodedata.category(ch) != "Mn")
+    word_norm = word_norm.replace("đ", "d")
 
     ampm_match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", cleaned, flags=re.IGNORECASE)
     if ampm_match:
         token = f"{ampm_match.group(1)}:{ampm_match.group(2) or '00'} {ampm_match.group(3)}"
         return _parse_12h_time_to_minutes(token)
 
+    # HH:MM / HHhMM
     hm_match = re.search(r"\b(\d{1,2})\s*[:h]\s*(\d{1,2})?\b", cleaned, flags=re.IGNORECASE)
     if hm_match:
         hour = int(hm_match.group(1))
         minute = int(hm_match.group(2) or "0")
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return hour * 60 + minute
+
+    # HHhMMp / HHhMM phut
+    hmp_match = re.search(r"\b(\d{1,2})\s*h\s*(\d{1,2})\s*(?:p|phut)?\b", word_norm)
+    if hmp_match:
+        hour = int(hmp_match.group(1))
+        minute = int(hmp_match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour * 60 + minute
+
+    # H giờ M phút / H gio M phut
+    vn_match = re.search(
+        r"\b(\d{1,2})\s*gio(?:\s*(\d{1,2})(?:\s*(?:phut|p))?)?\b",
+        word_norm,
+    )
+    if vn_match:
+        hour = int(vn_match.group(1))
+        minute_raw = vn_match.group(2)
+        minute = int(minute_raw or "0")
+        # Avoid accidental parse like "13 gio 23/3" -> 13:23 (day part).
+        tail = word_norm[vn_match.end() :].lstrip()
+        if minute_raw and tail[:1] in {"/", "-", "."}:
+            minute = 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour * 60 + minute
+
+    # Hh / Hg / H giờ (no minute)
+    short_hour_match = re.search(r"\b(\d{1,2})\s*(?:h|g|gio)\b", word_norm)
+    if short_hour_match:
+        hour = int(short_hour_match.group(1))
+        if 0 <= hour <= 23:
+            return hour * 60
     return None
 
 
@@ -671,7 +708,37 @@ def _parse_date_from_text(text: str, now: datetime) -> tuple[date | None, bool]:
         except ValueError:
             return None, False
 
+    # dd/mm (without year) => assume current year.
+    short_date_match = re.search(r"\b(\d{1,2})\s*[\/\-.]\s*(\d{1,2})\b", raw)
+    if short_date_match:
+        day = int(short_date_match.group(1))
+        month = int(short_date_match.group(2))
+        year = now.year
+        try:
+            guessed = datetime(year, month, day).date()
+            return guessed, True
+        except ValueError:
+            return None, False
+
     normalized = _normalize_text(raw)
+    # ngay 23 thang 3 nam 2026 / 23 thang 3 2026
+    vn_date_match = re.search(
+        r"\b(?:ngay\s*)?(\d{1,2})\s*thang\s*(\d{1,2})(?:\s*(?:nam\s*)?(\d{2,4}))?\b",
+        normalized,
+    )
+    if vn_date_match:
+        day = int(vn_date_match.group(1))
+        month = int(vn_date_match.group(2))
+        year_raw = vn_date_match.group(3)
+        year = int(year_raw) if year_raw else now.year
+        if year < 100:
+            year += 2000
+        try:
+            guessed = datetime(year, month, day).date()
+            return guessed, True
+        except ValueError:
+            return None, False
+
     if re.search(r"\b(ngay mai|tomorrow)\b", normalized) or re.search(r"\bmai\b", normalized):
         return (now + timedelta(days=1)).date(), True
     if re.search(r"\b(hom nay|today)\b", normalized):
@@ -1183,9 +1250,18 @@ def schedule_shop_appointment(request_text: str, shop_name: str = "") -> str:
             f"Lịch mới: {_format_slot(chosen_slot)} tại {selected_shop.get('name', 'tiệm đã chọn')}."
         )
     else:
-        parts.append(
-            "Bạn chưa nói rõ ngày giờ, mình đã đặt khung trống gần nhất theo giờ làm việc của tiệm."
-        )
+        if has_explicit_date and not has_explicit_time:
+            parts.append(
+                "Bạn chưa nói rõ giờ hẹn, mình đã đặt khung trống gần nhất theo giờ làm việc của tiệm."
+            )
+        elif has_explicit_time and not has_explicit_date:
+            parts.append(
+                "Bạn chưa nói rõ ngày hẹn, mình đã đặt khung trống gần nhất theo giờ làm việc của tiệm."
+            )
+        else:
+            parts.append(
+                "Bạn chưa nói rõ ngày giờ, mình đã đặt khung trống gần nhất theo giờ làm việc của tiệm."
+            )
         parts.append(
             f"Lịch hẹn: {_format_slot(chosen_slot)} tại {selected_shop.get('name', 'tiệm đã chọn')}."
         )
