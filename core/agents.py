@@ -86,6 +86,7 @@ def advise(user_message: str, analyzed_data: list[dict], intent_info: dict) -> d
             "name": s.get("name"),
             "phone": s.get("phone"),
             "address": s.get("additional_info", {}).get("address", ""),
+            "distance_km": s.get("_distance_km"),
             "metrics": s.get("metrics"),
             "risk_label": s.get("_risk"),
             "working_hours": s.get("working_hours"),

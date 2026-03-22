@@ -9,6 +9,79 @@ const TTS_LANG = "vi-VN";
 const TTS_RATE = 1.3;
 const BUSY_TIMELINE_STEP_MIN = 120;
 const BUSY_TIMELINE_SLOTS = 12;
+const GEO_REQUEST_TIMEOUT_MS = Number(import.meta.env.VITE_GEO_REQUEST_TIMEOUT_MS || 12000);
+const DAY_ALIAS_MAP = {
+  monday: "Monday",
+  mon: "Monday",
+  "thu 2": "Monday",
+  "thu hai": "Monday",
+  tuesday: "Tuesday",
+  tue: "Tuesday",
+  tues: "Tuesday",
+  "thu 3": "Tuesday",
+  "thu ba": "Tuesday",
+  wednesday: "Wednesday",
+  wed: "Wednesday",
+  "thu 4": "Wednesday",
+  "thu tu": "Wednesday",
+  thursday: "Thursday",
+  thu: "Thursday",
+  thur: "Thursday",
+  thurs: "Thursday",
+  "thu 5": "Thursday",
+  "thu nam": "Thursday",
+  friday: "Friday",
+  fri: "Friday",
+  "thu 6": "Friday",
+  "thu sau": "Friday",
+  saturday: "Saturday",
+  sat: "Saturday",
+  "thu 7": "Saturday",
+  sunday: "Sunday",
+  sun: "Sunday",
+  "chu nhat": "Sunday",
+  cn: "Sunday"
+};
+
+function normalizeKeywordText(text) {
+  if (typeof text !== "string") return "";
+  return text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/đ/g, "d")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function isNearbyQueryText(text) {
+  const normalized = normalizeKeywordText(text);
+  if (!normalized) return false;
+  const keywords = [
+    "gan day",
+    "gan nhat",
+    "xung quanh",
+    "o gan toi",
+    "near me",
+    "nearby",
+    "nearest",
+    "closest"
+  ];
+  return keywords.some((k) => normalized.includes(k));
+}
+
+function serializeUserCoords(coords) {
+  if (!coords) return null;
+  const lat = Number(coords.lat);
+  const lng = Number(coords.lng);
+  const accuracy = Number(coords.accuracy);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return {
+    lat,
+    lng,
+    accuracy: Number.isFinite(accuracy) ? accuracy : null
+  };
+}
 
 function haversineKm(lat1, lon1, lat2, lon2) {
   const toRad = (v) => (v * Math.PI) / 180;
@@ -80,18 +153,35 @@ function buildShopTags(shop) {
 
 function parseTimeTokenToMinutes(token) {
   if (typeof token !== "string") return null;
-  const m = token.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/i);
-  if (!m) return null;
-  let hour = Number(m[1]);
-  const minute = Number(m[2] || 0);
-  const meridiem = String(m[3]).toUpperCase();
-  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
-  if (hour < 1 || hour > 12 || minute < 0 || minute > 59) return null;
-  if (meridiem === "AM") {
-    if (hour === 12) hour = 0;
-  } else if (hour !== 12) {
-    hour += 12;
+  const cleaned = token
+    .replace(/\u202f/g, " ")
+    .replace(/â€¯/g, " ")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return null;
+
+  const ampmMatch = cleaned.match(/^(\d{1,2})(?::(\d{2}))?\s*([AaPp]\.?\s*[Mm]\.?)$/);
+  if (ampmMatch) {
+    let hour = Number(ampmMatch[1]);
+    const minute = Number(ampmMatch[2] || 0);
+    const meridiem = ampmMatch[3].toUpperCase().replace(/\./g, "").replace(/\s+/g, "");
+    if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+    if (hour < 1 || hour > 12 || minute < 0 || minute > 59) return null;
+    if (meridiem === "AM") {
+      if (hour === 12) hour = 0;
+    } else if (hour !== 12) {
+      hour += 12;
+    }
+    return hour * 60 + minute;
   }
+
+  const h24Match = cleaned.match(/^(\d{1,2})(?::|h)?(\d{1,2})?$/i);
+  if (!h24Match) return null;
+  const hour = Number(h24Match[1]);
+  const minute = Number(h24Match[2] || 0);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
   return hour * 60 + minute;
 }
 
@@ -160,14 +250,28 @@ function getTodayName(now = new Date()) {
   return now.toLocaleDateString("en-US", { weekday: "long" });
 }
 
+function normalizeDayName(rawDay) {
+  if (typeof rawDay !== "string") return "";
+  const base = rawDay
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+  return DAY_ALIAS_MAP[base] || rawDay.trim();
+}
+
 function getTodayBusynessSeries(shop, now = new Date()) {
   const all = Array.isArray(shop?.busyness) ? shop.busyness : [];
-  const dayName = getTodayName(now);
+  const dayName = normalizeDayName(getTodayName(now));
   const rows = all
-    .filter((item) => item?.day === dayName)
+    .filter((item) => {
+      const normalizedDay = normalizeDayName(String(item?.day || ""));
+      return normalizedDay && normalizedDay === dayName;
+    })
     .map((item) => ({
       time: item?.time || "",
-      percent: Math.max(0, Math.min(100, Number(item?.percent) || 0)),
+      percent: Math.max(0, Math.min(100, Number(String(item?.percent ?? "").replace("%", "")) || 0)),
       minute: parseBusynessTimeToMinutes(item?.time || "")
     }))
     .filter((item) => Number.isFinite(item.minute));
@@ -266,6 +370,10 @@ function formatMeters(meters, approximate = false) {
 function formatDistanceKm(shop, userCoords, routeMeters) {
   if (Number.isFinite(routeMeters)) {
     return formatMeters(routeMeters, false);
+  }
+  const backendMeters = Number(shop?._distance_m);
+  if (Number.isFinite(backendMeters) && backendMeters > 0) {
+    return formatMeters(backendMeters, false);
   }
 
   const lat = Number(shop?.latitude);
@@ -375,6 +483,8 @@ function App() {
   const [recording, setRecording] = useState(false);
   const [sttEngine, setSttEngine] = useState("Blaze");
   const [userCoords, setUserCoords] = useState(null);
+  const [geoStatus, setGeoStatus] = useState("idle");
+  const [geoError, setGeoError] = useState("");
   const [selectedShop, setSelectedShop] = useState(null);
   const [clockTick, setClockTick] = useState(Date.now());
   const [routeDistanceByShop, setRouteDistanceByShop] = useState({});
@@ -408,51 +518,113 @@ function App() {
     return () => clearInterval(timer);
   }, []);
 
-  useEffect(() => {
-    if (!navigator.geolocation) return;
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        if ((pos.coords.accuracy ?? 9999) <= 1500) {
-          setUserCoords({
-            lat: pos.coords.latitude,
-            lng: pos.coords.longitude,
-            accuracy: pos.coords.accuracy
-          });
-        }
-      },
-      () => setUserCoords(null),
-      {
-        enableHighAccuracy: true,
-        timeout: 7000,
-        maximumAge: 60_000
+  function buildCoordsFromPosition(pos) {
+    const lat = Number(pos?.coords?.latitude);
+    const lng = Number(pos?.coords?.longitude);
+    const accuracy = Number(pos?.coords?.accuracy);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    return {
+      lat,
+      lng,
+      accuracy: Number.isFinite(accuracy) ? accuracy : null
+    };
+  }
+
+  function applyCoordsFromPosition(pos) {
+    const next = buildCoordsFromPosition(pos);
+    if (!next) return null;
+
+    setUserCoords((prev) => {
+      if (!prev) return next;
+      const movedKm = haversineKm(prev.lat, prev.lng, next.lat, next.lng);
+      const prevAcc = Number.isFinite(prev.accuracy) ? prev.accuracy : 999999;
+      const nextAcc = Number.isFinite(next.accuracy) ? next.accuracy : 999999;
+      const accuracyImproved = nextAcc + 40 < prevAcc;
+      if (movedKm < 0.03 && !accuracyImproved) return prev;
+      return next;
+    });
+    setGeoStatus("ready");
+    setGeoError("");
+    return next;
+  }
+
+  function handleGeoError(error) {
+    const code = Number(error?.code || 0);
+    if (code === 1) {
+      setGeoStatus("denied");
+      setGeoError("Bạn đang chặn quyền vị trí trên trình duyệt.");
+      return;
+    }
+    if (code === 2) {
+      setGeoStatus("unavailable");
+      setGeoError("Thiết bị chưa cung cấp được vị trí. Hãy bật GPS/Wi-Fi.");
+      return;
+    }
+    if (code === 3) {
+      setGeoStatus("timeout");
+      setGeoError("Lấy vị trí bị timeout, đang thử lại bằng nguồn gần đúng.");
+      return;
+    }
+    setGeoStatus("error");
+    setGeoError("Không lấy được vị trí hiện tại.");
+  }
+
+  function requestOneShotLocation(timeoutMs = GEO_REQUEST_TIMEOUT_MS) {
+    return new Promise((resolve) => {
+      if (!navigator.geolocation) {
+        setGeoStatus("unsupported");
+        setGeoError("Trình duyệt không hỗ trợ geolocation.");
+        resolve(null);
+        return;
       }
-    );
+
+      setGeoStatus((prev) => (prev === "ready" ? prev : "requesting"));
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve(applyCoordsFromPosition(pos)),
+        (err) => {
+          handleGeoError(err);
+          resolve(null);
+        },
+        {
+          enableHighAccuracy: false,
+          timeout: Math.max(5000, timeoutMs),
+          maximumAge: 120_000
+        }
+      );
+    });
+  }
+
+  useEffect(() => {
+    const host = window.location.hostname;
+    const isLocalhost = host === "localhost" || host === "127.0.0.1" || host === "::1";
+    if (!window.isSecureContext && !isLocalhost) {
+      setGeoStatus("insecure");
+      setGeoError("Geolocation chỉ hoạt động trên HTTPS hoặc localhost.");
+      return;
+    }
+    void requestOneShotLocation();
   }, []);
 
   useEffect(() => {
     if (!navigator.geolocation) return undefined;
+    const host = window.location.hostname;
+    const isLocalhost = host === "localhost" || host === "127.0.0.1" || host === "::1";
+    if (!window.isSecureContext && !isLocalhost) return undefined;
+
     const watchId = navigator.geolocation.watchPosition(
       (pos) => {
-        const next = {
-          lat: pos.coords.latitude,
-          lng: pos.coords.longitude,
-          accuracy: pos.coords.accuracy
-        };
-        if ((next.accuracy ?? 9999) <= 1500) {
-          setUserCoords((prev) => {
-            if (!prev) return next;
-            const movedKm = haversineKm(prev.lat, prev.lng, next.lat, next.lng);
-            const accuracyImproved = (prev.accuracy ?? 9999) - (next.accuracy ?? 9999) > 120;
-            if (movedKm < 0.06 && !accuracyImproved) return prev;
-            return next;
-          });
+        applyCoordsFromPosition(pos);
+      },
+      (err) => {
+        // Don't spam UI for transient watcher errors except permission denied.
+        if (Number(err?.code || 0) === 1) {
+          handleGeoError(err);
         }
       },
-      () => {},
       {
-        enableHighAccuracy: true,
-        timeout: 7000,
-        maximumAge: 10_000
+        enableHighAccuracy: false,
+        timeout: Math.max(8000, GEO_REQUEST_TIMEOUT_MS),
+        maximumAge: 30_000
       }
     );
     return () => navigator.geolocation.clearWatch(watchId);
@@ -468,9 +640,21 @@ function App() {
 
   const now = useMemo(() => new Date(clockTick), [clockTick]);
   const topShops = useMemo(() => {
-    return [...shops]
-      .sort((a, b) => Number(b?._trust ?? 0) - Number(a?._trust ?? 0))
-      .slice(0, 4);
+    const items = Array.isArray(shops) ? [...shops] : [];
+    const hasDistanceRanking = items.some((shop) => Number.isFinite(Number(shop?._distance_km)));
+    if (hasDistanceRanking) {
+      items.sort((a, b) => {
+        const ad = Number(a?._distance_km);
+        const bd = Number(b?._distance_km);
+        const aMissing = !Number.isFinite(ad);
+        const bMissing = !Number.isFinite(bd);
+        if (aMissing !== bMissing) return aMissing ? 1 : -1;
+        if (!aMissing && !bMissing && ad !== bd) return ad - bd;
+        return Number(b?._trust ?? 0) - Number(a?._trust ?? 0);
+      });
+    }
+    // Keep backend order for non-distance queries.
+    return items.slice(0, 4);
   }, [shops]);
 
   useEffect(() => {
@@ -711,10 +895,19 @@ function App() {
     setMessages((prev) => [...prev, { role: "user", content: msg }]);
 
     try {
+      let coordsPayload = serializeUserCoords(userCoords);
+      if (!coordsPayload && isNearbyQueryText(msg)) {
+        const oneshot = await requestOneShotLocation(GEO_REQUEST_TIMEOUT_MS);
+        coordsPayload = serializeUserCoords(oneshot);
+      }
+
       const resp = await fetch(`${API_BASE}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: msg })
+        body: JSON.stringify({
+          message: msg,
+          user_coords: coordsPayload
+        })
       });
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.detail || "Chat API failed");
@@ -813,6 +1006,16 @@ function App() {
   const selectedRouteMeters = selectedShop
     ? routeDistanceByShop[shopDistanceKey(selectedShop)]
     : undefined;
+  const geoHintText =
+    geoStatus === "ready"
+      ? `Vị trí đã sẵn sàng${Number.isFinite(userCoords?.accuracy) ? ` (±${Math.round(userCoords.accuracy)}m)` : ""}.`
+      : geoStatus === "requesting"
+        ? "Đang lấy vị trí hiện tại..."
+        : geoStatus === "denied"
+          ? "Bạn chưa cấp quyền vị trí. Hãy Allow Location trong trình duyệt."
+          : geoStatus === "insecure"
+            ? "Trang cần chạy HTTPS hoặc localhost để lấy vị trí."
+            : geoError || "Chưa có vị trí hiện tại.";
 
   return (
     <div className={`app-shell mode-${uiMode}`}>
@@ -860,6 +1063,7 @@ function App() {
                 </button>
               </div>
               <p className="voice-hint">Nhấn mic để nói với assistant.</p>
+              <p className="voice-hint">{geoHintText}</p>
 
               {uiMode === "phone" && (
                 <section className="phone-suggestions">

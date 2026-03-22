@@ -107,7 +107,8 @@ async def chat(payload: ChatRequest) -> ChatResponse:
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="Missing OPENAI_API_KEY")
 
-    result = await pipeline.run_async(payload.message)
+    coords_dict = payload.user_coords.model_dump() if payload.user_coords else None
+    result = await pipeline.run_async(payload.message, user_coords=coords_dict)
     return ChatResponse(
         reply=result.display_text,
         intent=result.intent_info,

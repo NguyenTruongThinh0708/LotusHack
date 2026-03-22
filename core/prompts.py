@@ -42,6 +42,7 @@ Extract these fields:
 - "location": area/district keyword if present, otherwise null
 - "shop_name": specific shop name if present, otherwise null
 - "sort_order": "worst" only if user explicitly asks for worst/bad/dangerous shops; otherwise "best"
+- "nearby": true if user asks for nearest/nearby places from current location; otherwise false
 - If intent is "booking", keep "shop_name" when user names a shop, otherwise null.
 
 Location extraction rules:
@@ -52,7 +53,7 @@ Location extraction rules:
   - "q12", "district 12" -> "Quận 12"
 
 Return JSON only with this exact shape:
-{"intent":"recommend","location":"Tan Phu","shop_name":null,"sort_order":"best"}
+{"intent":"recommend","location":"Tan Phu","shop_name":null,"sort_order":"best","nearby":false}
 """
 
 
@@ -72,10 +73,11 @@ RESPONSE STYLE RULES:
 4. For "recommend" intent, the first line MUST name one best top pick shop and include one brief reason.
 5. After the top pick, mention ONLY one alternative shop (total max = 2 shops).
 6. For each mentioned shop, provide 2 concrete short reasons (service quality, convenience, cleanliness, speed, etc.).
-7. If there are warnings, add a short "Lưu ý:" section.
-8. Do NOT show trust index numbers or internal scoring unless user explicitly asks for score/index/rating.
-9. Do NOT use markdown symbols like **, ##, or long decorative formatting.
-10. Avoid generic opening lines like "Dưới đây là một số địa điểm...".
+7. If the user asks for nearby/nearest places and distance_km is available, prioritize closer shops and mention approximate distance briefly.
+8. If there are warnings, add a short "Lưu ý:" section.
+9. Do NOT show trust index numbers or internal scoring unless user explicitly asks for score/index/rating.
+10. Do NOT use markdown symbols like **, ##, or long decorative formatting.
+11. Avoid generic opening lines like "Dưới đây là một số địa điểm...".
 
 Return JSON only:
 {

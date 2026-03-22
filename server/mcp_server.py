@@ -51,6 +51,35 @@ _DAY_NAME_MAP = {
     "saturday": "Saturday",
     "sunday": "Sunday",
 }
+_DAY_ALIASES = {
+    "mon": "Monday",
+    "monday": "Monday",
+    "thu 2": "Monday",
+    "thu hai": "Monday",
+    "tue": "Tuesday",
+    "tuesday": "Tuesday",
+    "thu 3": "Tuesday",
+    "thu ba": "Tuesday",
+    "wed": "Wednesday",
+    "wednesday": "Wednesday",
+    "thu 4": "Wednesday",
+    "thu tu": "Wednesday",
+    "thu 5": "Thursday",
+    "thu nam": "Thursday",
+    "thursday": "Thursday",
+    "thu": "Thursday",
+    "thu 6": "Friday",
+    "thu sau": "Friday",
+    "fri": "Friday",
+    "friday": "Friday",
+    "sat": "Saturday",
+    "saturday": "Saturday",
+    "thu 7": "Saturday",
+    "sun": "Sunday",
+    "sunday": "Sunday",
+    "chu nhat": "Sunday",
+    "cn": "Sunday",
+}
 _BOOKING_DURATION_MIN = 60
 _BOOKING_STEP_MIN = 30
 _BOOKING_LOOKAHEAD_DAYS = 21
@@ -189,6 +218,48 @@ def _normalize_text(text: str) -> str:
     return normalized
 
 
+def _normalize_day_name(raw_day: Any) -> str:
+    original = str(raw_day or "").strip()
+    if not original:
+        return ""
+    normalized = _normalize_text(original)
+    return _DAY_ALIASES.get(normalized, original)
+
+
+def _normalize_time_label(raw_time: Any) -> str:
+    value = str(raw_time or "").strip()
+    if not value:
+        return ""
+    # Handle normal thin-space + common mojibake artifacts seen from imported JSON.
+    value = value.replace("\u202f", " ").replace("â€¯", " ").replace("\xa0", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    value = re.sub(r"\bA\.?\s*M\.?\b", "AM", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bP\.?\s*M\.?\b", "PM", value, flags=re.IGNORECASE)
+    return value
+
+
+def _extract_percent(raw_percent: Any) -> int | None:
+    value = raw_percent
+    if isinstance(value, str):
+        found = re.search(r"-?\d+(?:\.\d+)?", value)
+        if not found:
+            return None
+        value = found.group(0)
+    percent = _to_float(value, default=float("nan"))
+    if percent != percent:  # NaN check
+        return None
+    return max(0, min(100, int(round(percent))))
+
+
+def _append_popular_row(out: list[dict], raw_day: Any, raw_time: Any, raw_percent: Any) -> None:
+    day = _normalize_day_name(raw_day)
+    time = _normalize_time_label(raw_time)
+    percent = _extract_percent(raw_percent)
+    if not day or not time or percent is None:
+        return
+    out.append({"day": day, "time": time, "percent": percent})
+
+
 def _normalize_operating_hours(raw_hours: Any) -> dict[str, str]:
     if not isinstance(raw_hours, dict):
         return {}
@@ -207,40 +278,97 @@ def _normalize_popular_times(raw_popular_times: Any) -> list[dict]:
     if isinstance(raw_popular_times, list):
         out = []
         for row in raw_popular_times:
+            if isinstance(row, (list, tuple)) and len(row) >= 3:
+                _append_popular_row(out, row[0], row[1], row[2])
+                continue
+
             if not isinstance(row, dict):
                 continue
-            day = str(row.get("day") or "").strip()
-            time = str(row.get("time") or "").replace("\u202f", " ").strip()
-            percent = _to_float(row.get("percent"), default=0.0)
-            out.append(
-                {
-                    "day": day,
-                    "time": time,
-                    "percent": max(0, min(100, int(round(percent)))),
-                }
-            )
+
+            day = row.get("day") or row.get("weekday") or row.get("day_name")
+
+            nested_entries = row.get("entries") or row.get("times") or row.get("data")
+            if isinstance(nested_entries, list) and day:
+                for nested in nested_entries:
+                    if isinstance(nested, dict):
+                        _append_popular_row(
+                            out,
+                            day,
+                            nested.get("time") or nested.get("hour") or nested.get("label"),
+                            nested.get("percent")
+                            if "percent" in nested
+                            else nested.get("value", nested.get("busyness")),
+                        )
+                continue
+
+            time = row.get("time") or row.get("hour") or row.get("label")
+            percent = row.get("percent")
+            if percent is None:
+                percent = row.get("value", row.get("busyness"))
+            if day and time is not None and percent is not None:
+                _append_popular_row(out, day, time, percent)
+                continue
+
+            if len(row) == 1:
+                k, v = next(iter(row.items()))
+                if isinstance(k, str):
+                    _append_popular_row(out, "Unknown", k, v)
         return out
 
     if not isinstance(raw_popular_times, dict):
         return []
 
     out: list[dict] = []
-    for day, entries in raw_popular_times.items():
+    for raw_day, entries in raw_popular_times.items():
+        if isinstance(entries, dict):
+            for time, percent in entries.items():
+                _append_popular_row(out, raw_day, time, percent)
+            continue
+
         if not isinstance(entries, list):
             continue
+
         for item in entries:
-            if not isinstance(item, dict):
+            if isinstance(item, dict):
+                _append_popular_row(
+                    out,
+                    raw_day,
+                    item.get("time") or item.get("hour") or item.get("label"),
+                    item.get("percent")
+                    if "percent" in item
+                    else item.get("value", item.get("busyness")),
+                )
                 continue
-            time = str(item.get("time") or "").replace("\u202f", " ").strip()
-            percent = _to_float(item.get("percent"), default=0.0)
-            out.append(
-                {
-                    "day": str(day or "").strip(),
-                    "time": time,
-                    "percent": max(0, min(100, int(round(percent)))),
-                }
-            )
+
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                _append_popular_row(out, raw_day, item[0], item[1])
+                continue
+
+            if isinstance(item, str):
+                _append_popular_row(out, raw_day, item, 0)
     return out
+
+
+def _extract_raw_busyness(record: dict, additional_info: dict) -> Any:
+    candidates = [
+        record.get("busyness"),
+        record.get("popular_times"),
+        record.get("popularTime"),
+        record.get("popular_time"),
+        record.get("busy_hours"),
+        record.get("busy_times"),
+        record.get("busyness_data"),
+        record.get("busyness_by_day"),
+        additional_info.get("busyness"),
+        additional_info.get("popular_times"),
+        additional_info.get("popularTime"),
+        additional_info.get("busy_hours"),
+    ]
+    for candidate in candidates:
+        normalized = _normalize_popular_times(candidate)
+        if normalized:
+            return normalized
+    return []
 
 
 def _extract_extensions(raw_extensions: Any) -> list[dict]:
@@ -412,15 +540,15 @@ def _normalize_shop_record(record: dict) -> dict:
 
     working_hours = record.get("working_hours")
     if not isinstance(working_hours, dict) or not working_hours:
-        working_hours = _normalize_operating_hours(record.get("operating_hours"))
+        working_hours = _normalize_operating_hours(
+            record.get("operating_hours")
+            or additional_info.get("working_hours")
+            or additional_info.get("operating_hours")
+        )
     else:
         working_hours = _normalize_operating_hours(working_hours)
 
-    busyness = record.get("busyness")
-    if not isinstance(busyness, list) or not busyness:
-        busyness = _normalize_popular_times(record.get("popular_times"))
-    else:
-        busyness = _normalize_popular_times(busyness)
+    busyness = _extract_raw_busyness(record, additional_info)
 
     normalized = {
         "name": str(record.get("name") or record.get("title") or "").strip(),

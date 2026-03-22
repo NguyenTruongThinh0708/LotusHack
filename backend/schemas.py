@@ -3,8 +3,15 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+class UserCoords(BaseModel):
+    lat: float
+    lng: float
+    accuracy: Optional[float] = None
+
+
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
+    user_coords: Optional[UserCoords] = None
 
 
 class ChatResponse(BaseModel):
