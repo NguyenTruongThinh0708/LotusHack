@@ -160,6 +160,17 @@ function shortenTag(tag) {
   return `${tag.slice(0, 19).trim()}…`;
 }
 
+function extractSpecialFeatureTags(shop) {
+  const direct = Array.isArray(shop?.special_features)
+    ? shop.special_features
+    : Array.isArray(shop?.additional_info?.special_features)
+      ? shop.additional_info.special_features
+      : [];
+  return direct
+    .filter((item) => typeof item === "string" && item.trim())
+    .map((item) => item.trim());
+}
+
 function buildCriteriaTagsFromMetrics(shop) {
   const metrics =
     shop?.metrics && typeof shop.metrics === "object"
@@ -181,14 +192,30 @@ function buildCriteriaTagsFromMetrics(shop) {
   return { tags, hasCriteriaMetric };
 }
 
-function buildShopTags(shop) {
+function buildShopTags(shop, options = {}) {
+  const max = Number.isFinite(Number(options.max)) ? Math.max(1, Number(options.max)) : 3;
+  const specialFeatureTags = extractSpecialFeatureTags(shop);
   const tagsFromBackend = Array.isArray(shop?.tags)
     ? shop.tags.filter((tag) => typeof tag === "string" && tag.trim()).map((tag) => tag.trim())
     : [];
   const { tags: criteriaTags, hasCriteriaMetric } = buildCriteriaTagsFromMetrics(shop);
-  const finalTags = hasCriteriaMetric ? criteriaTags : tagsFromBackend;
+  const finalTags = [
+    ...specialFeatureTags,
+    ...(hasCriteriaMetric ? criteriaTags : []),
+    ...tagsFromBackend
+  ];
 
-  const unique = [...new Set(finalTags.map(shortenTag))].slice(0, 3);
+  const seen = new Set();
+  const unique = [];
+  for (const tag of finalTags) {
+    const short = shortenTag(String(tag || "").trim());
+    if (!short) continue;
+    const key = normalizeKeywordText(short);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(short);
+    if (unique.length >= max) break;
+  }
   if (unique.length === 0) return ["Chưa có tag"];
   return unique;
 }
@@ -1191,7 +1218,7 @@ function App() {
               </div>
             </div>
             <div className="shop-modal-tags">
-              {buildShopTags(selectedShop).map((tag, idx) => (
+              {buildShopTags(selectedShop, { max: 8 }).map((tag, idx) => (
                 <span key={`${tag}-${idx}`} className="tag-chip">
                   {tag}
                 </span>

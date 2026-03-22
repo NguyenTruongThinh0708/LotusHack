@@ -508,6 +508,38 @@ def _build_criteria_tags(metrics: dict) -> list[str]:
     return tags
 
 
+def _normalize_special_features(raw_features: Any) -> list[str]:
+    if isinstance(raw_features, str):
+        value = raw_features.strip()
+        return [value] if value else []
+
+    if isinstance(raw_features, dict):
+        out: list[str] = []
+        for key, value in raw_features.items():
+            if isinstance(value, bool) and not value:
+                continue
+            label = str(key or "").strip()
+            if label:
+                out.append(label)
+        return out
+
+    if not isinstance(raw_features, list):
+        return []
+
+    out: list[str] = []
+    for item in raw_features:
+        if isinstance(item, str):
+            value = item.strip()
+            if value:
+                out.append(value)
+            continue
+        if isinstance(item, dict):
+            label = str(item.get("name") or item.get("feature") or "").strip()
+            if label:
+                out.append(label)
+    return out
+
+
 def _normalize_shop_record(record: dict) -> dict:
     additional_info = record.get("additional_info")
     if not isinstance(additional_info, dict):
@@ -537,6 +569,10 @@ def _normalize_shop_record(record: dict) -> dict:
 
     metrics = _normalize_metrics(record)
     criteria_tags = _build_criteria_tags(metrics)
+    special_features = _normalize_special_features(
+        record.get("special_features")
+        or additional_info.get("special_features")
+    )
 
     working_hours = record.get("working_hours")
     if not isinstance(working_hours, dict) or not working_hours:
@@ -563,6 +599,7 @@ def _normalize_shop_record(record: dict) -> dict:
         "website": record.get("website"),
         "metrics": metrics,
         "tags": criteria_tags,
+        "special_features": special_features,
         "top_reviews": _normalize_top_reviews(record.get("top_reviews")),
         "thumbnail": record.get("thumbnail"),
         "rating": _to_float(record.get("rating"), default=0.0),
@@ -572,6 +609,7 @@ def _normalize_shop_record(record: dict) -> dict:
             "services": services,
             "type": shop_types,
             "extensions": extensions,
+            "special_features": special_features,
         },
         "place_id": record.get("place_id"),
     }
@@ -961,6 +999,7 @@ def _compact_shop_for_booking_response(shop: dict) -> dict:
         "website": shop.get("website"),
         "metrics": shop.get("metrics"),
         "tags": shop.get("tags"),
+        "special_features": shop.get("special_features"),
         "top_reviews": (shop.get("top_reviews") or [])[:2],
         "thumbnail": shop.get("thumbnail"),
         "rating": shop.get("rating"),
@@ -1130,6 +1169,7 @@ def compare_shops(shop_names: str) -> str:
                     "phone": shop.get("phone"),
                     "working_hours": shop.get("working_hours"),
                     "tags": shop.get("tags", []),
+                    "special_features": shop.get("special_features", []),
                 })
                 break
     return json.dumps(results, ensure_ascii=False)
@@ -1297,6 +1337,7 @@ def get_safest_shops(limit: int = 5) -> str:
             "metrics": shop.get("metrics", {}),
             "phone": shop.get("phone"),
             "tags": shop.get("tags", []),
+            "special_features": shop.get("special_features", []),
         })
     return json.dumps(results, ensure_ascii=False)
 

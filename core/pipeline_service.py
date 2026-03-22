@@ -115,9 +115,77 @@ class SafeWashPipeline:
                 requested.append(key)
         return requested
 
-    def _shop_matches_tags(self, shop: dict, requested_keys: list[str]) -> bool:
+    @staticmethod
+    def _normalize_feature_phrase(text: str) -> str:
+        normalized = SafeWashPipeline._normalize_for_keyword(text)
+        normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
+    def _iter_shop_special_features(self, shop: dict) -> list[str]:
+        raw_features: Any = shop.get("special_features")
+        additional_info = shop.get("additional_info")
+        if (not raw_features) and isinstance(additional_info, dict):
+            raw_features = additional_info.get("special_features")
+
+        collected: list[str] = []
+        if isinstance(raw_features, str):
+            value = raw_features.strip()
+            if value:
+                collected.append(value)
+        elif isinstance(raw_features, list):
+            for item in raw_features:
+                if isinstance(item, str):
+                    value = item.strip()
+                    if value:
+                        collected.append(value)
+                elif isinstance(item, dict):
+                    value = str(item.get("name") or item.get("feature") or "").strip()
+                    if value:
+                        collected.append(value)
+        elif isinstance(raw_features, dict):
+            for key, value in raw_features.items():
+                if isinstance(value, bool) and not value:
+                    continue
+                label = str(key or "").strip()
+                if label:
+                    collected.append(label)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in collected:
+            normalized = self._normalize_feature_phrase(item)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(item)
+        return deduped
+
+    def _extract_requested_special_features(self, user_message: str, shops: list[dict]) -> list[str]:
+        normalized_user = self._normalize_feature_phrase(user_message)
+        if not normalized_user or not shops:
+            return []
+
+        feature_lookup: dict[str, str] = {}
+        for shop in shops:
+            for feature in self._iter_shop_special_features(shop):
+                normalized = self._normalize_feature_phrase(feature)
+                if normalized and normalized not in feature_lookup:
+                    feature_lookup[normalized] = feature
+
+        requested: list[str] = []
+        for normalized, original in sorted(
+            feature_lookup.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            if self._match_keyword(normalized_user, normalized):
+                requested.append(original)
+        return requested
+
+    def _shop_tag_match_count(self, shop: dict, requested_keys: list[str]) -> int:
         if not requested_keys:
-            return True
+            return 0
 
         metrics = shop.get("metrics") if isinstance(shop.get("metrics"), dict) else {}
         tags = shop.get("tags") if isinstance(shop.get("tags"), list) else []
@@ -125,13 +193,38 @@ class SafeWashPipeline:
             self._normalize_for_keyword(str(tag)) for tag in tags if isinstance(tag, str)
         )
 
+        matched = 0
         for key in requested_keys:
             score = self._to_float(metrics.get(key))
             metric_ok = score is not None and score >= 1
             tag_ok = any(self._match_keyword(normalized_tags, kw) for kw in TAG_KEYWORDS.get(key, set()))
-            if not metric_ok and not tag_ok:
-                return False
-        return True
+            if metric_ok or tag_ok:
+                matched += 1
+        return matched
+
+    def _shop_matches_tags(self, shop: dict, requested_keys: list[str]) -> bool:
+        if not requested_keys:
+            return True
+        return self._shop_tag_match_count(shop, requested_keys) >= len(requested_keys)
+
+    def _shop_special_feature_match_count(self, shop: dict, requested_features: list[str]) -> int:
+        if not requested_features:
+            return 0
+
+        available: set[str] = set()
+        for item in self._iter_shop_special_features(shop):
+            normalized_item = self._normalize_feature_phrase(item)
+            if normalized_item:
+                available.add(normalized_item)
+        if not available:
+            return 0
+
+        matched = 0
+        for feature in requested_features:
+            normalized = self._normalize_feature_phrase(feature)
+            if normalized and normalized in available:
+                matched += 1
+        return matched
 
     def _filter_shops_by_requested_tags(
         self,
@@ -141,19 +234,53 @@ class SafeWashPipeline:
         logs: list[str],
     ) -> list[dict]:
         requested_keys = self._extract_requested_tag_keys(user_message)
-        if not requested_keys:
+        requested_special_features = self._extract_requested_special_features(user_message, shops)
+        if not requested_keys and not requested_special_features:
             return shops
 
-        intent_info["requested_tags"] = requested_keys
-        filtered = [shop for shop in shops if self._shop_matches_tags(shop, requested_keys)]
+        if requested_keys:
+            intent_info["requested_tags"] = requested_keys
+        if requested_special_features:
+            intent_info["requested_special_features"] = requested_special_features
+
+        filtered: list[dict] = []
+        for shop in shops:
+            tag_match_count = self._shop_tag_match_count(shop, requested_keys)
+            special_feature_match_count = self._shop_special_feature_match_count(
+                shop,
+                requested_special_features,
+            )
+            tag_ok = (not requested_keys) or (tag_match_count >= len(requested_keys))
+            special_feature_ok = (not requested_special_features) or (special_feature_match_count > 0)
+            if not tag_ok or not special_feature_ok:
+                continue
+            enriched = dict(shop)
+            enriched["_tag_match_count"] = tag_match_count
+            enriched["_special_feature_match_count"] = special_feature_match_count
+            filtered.append(enriched)
+
         labels = [TAG_DISPLAY_LABELS.get(k, k) for k in requested_keys]
+        criteria_parts: list[str] = []
+        if labels:
+            criteria_parts.append(f"tags={', '.join(labels)}")
+        if requested_special_features:
+            criteria_parts.append(f"special_features={', '.join(requested_special_features)}")
+        criteria_summary = "; ".join(criteria_parts) if criteria_parts else "criteria"
         if filtered:
+            filtered.sort(
+                key=lambda s: (
+                    -int(s.get("_special_feature_match_count", 0)),
+                    -int(s.get("_tag_match_count", 0)),
+                    s.get("_risk") == "CLOSED",
+                    -float(s.get("_trust", 0)),
+                )
+            )
             logs.append(
-                f"Tag filter applied: {', '.join(labels)} -> {len(filtered)}/{len(shops)} shops."
+                f"Tag filter applied ({criteria_summary}) -> {len(filtered)}/{len(shops)} shops."
             )
             return filtered
 
-        logs.append(f"Tag filter applied: {', '.join(labels)} -> 0 match.")
+        logs.append(f"Tag filter applied ({criteria_summary}) -> 0 match.")
         return []
 
     @staticmethod
@@ -520,15 +647,27 @@ class SafeWashPipeline:
         if not analyzed:
             location = (intent_info.get("location") or "").strip()
             requested_tags = intent_info.get("requested_tags") or []
+            requested_special_features = intent_info.get("requested_special_features") or []
             tag_labels = [
                 TAG_DISPLAY_LABELS.get(str(tag), str(tag))
                 for tag in requested_tags
                 if str(tag).strip()
             ]
+            special_feature_labels = [
+                str(feature).strip()
+                for feature in requested_special_features
+                if str(feature).strip()
+            ]
+            criteria_labels: list[str] = []
+            if tag_labels:
+                criteria_labels.append(f"tag: {', '.join(tag_labels)}")
+            if special_feature_labels:
+                criteria_labels.append(f"special feature: {', '.join(special_feature_labels)}")
+            criteria_text = " + ".join(criteria_labels)
             if intent_info.get("intent") == "recommend" and location:
-                if tag_labels:
+                if criteria_text:
                     not_found_text = (
-                        f"Không tìm thấy tiệm khớp khu vực '{location}' với tiêu chí tag: {', '.join(tag_labels)}. "
+                        f"Không tìm thấy tiệm khớp khu vực '{location}' với tiêu chí {criteria_text}. "
                         "Bạn thử nới tiêu chí hoặc đổi khu vực nhé."
                     )
                 else:
@@ -537,9 +676,9 @@ class SafeWashPipeline:
                         "Bạn thử khu vực lân cận hoặc nhập tên quận/huyện khác nhé."
                     )
             else:
-                if tag_labels:
+                if criteria_text:
                     not_found_text = (
-                        f"Không tìm thấy tiệm phù hợp với tag: {', '.join(tag_labels)}. "
+                        f"Không tìm thấy tiệm phù hợp với {criteria_text}. "
                         "Bạn thử đổi tiêu chí (ví dụ sạch/nhanh/giá tốt) hoặc thêm khu vực nhé."
                     )
                 else:
